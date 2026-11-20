@@ -553,3 +553,135 @@ body.static-mode .reader { height: calc(100vh - 28px); }
 .pdf-fallback { position: absolute; inset: 0; display: grid; place-items: center; text-align: center; color: var(--text-2); padding: 20px; }
 a.btn, a.btn:hover, a.icon-btn, a.icon-btn:hover { color: var(--text); text-decoration: none; }
 a.btn-primary, a.btn-primary:hover { color: var(--bg-2); }
+
+/* ---------- 多资源：资源条 / 资源标签（SPEC §13） ---------- */
+.rd-left { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+.rd-left .rd-pdf { flex: 1; min-height: 0; }
+.rd-view, .rd-view-inner { position: absolute; inset: 0; }
+.res-bar {
+  flex: none; display: flex; align-items: center; gap: 6px; padding: 5px 10px;
+  border-bottom: 1px solid var(--border); background: var(--bg-2);
+}
+.res-tabs { flex: 0 1 auto; min-width: 0; display: flex; align-items: center; gap: 4px; overflow-x: auto; scrollbar-width: none; }
+.res-tabs::-webkit-scrollbar { display: none; }
+.res-tab {
+  display: inline-flex; align-items: center; gap: 5px; height: 28px; padding: 0 10px; flex: none;
+  border: 1px solid transparent; border-radius: 7px; background: transparent; color: var(--text-2);
+  font-size: 12.5px; cursor: pointer; max-width: 280px; white-space: nowrap;
+}
+.res-tab:hover { background: var(--bg-hover); color: var(--text); }
+.res-tab.active { background: var(--accent-bg); color: var(--accent-text); border-color: color-mix(in srgb, var(--accent) 35%, transparent); font-weight: 550; }
+.res-tab.auto:not(.active) { border-style: dashed; border-color: var(--border-2); }
+.res-tab .rt-ic { font-size: 13px; line-height: 1; }
+.res-tab .rt-label { overflow: hidden; text-overflow: ellipsis; }
+.res-tab .rt-more { display: inline-flex; margin-left: 2px; padding: 2px; border-radius: 4px; opacity: .7; }
+.res-tab .rt-more:hover { background: var(--bg-active); opacity: 1; }
+.res-add {
+  display: inline-flex; align-items: center; gap: 4px; height: 26px; padding: 0 9px; flex: none; margin-left: 2px;
+  border: 1px dashed var(--border-2); border-radius: 7px; background: transparent; color: var(--text-3); font-size: 12px; cursor: pointer;
+}
+.res-add:hover { color: var(--accent); border-color: var(--accent); }
+.res-chips { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 7px; }
+.res-chip {
+  display: inline-flex; align-items: center; gap: 4px; height: 22px; padding: 0 8px; border-radius: 11px;
+  border: 1px solid var(--border); background: var(--bg-3); color: var(--text-2); font-size: 11.5px; text-decoration: none; cursor: pointer; max-width: 260px;
+}
+.res-chip:hover { border-color: var(--border-2); color: var(--text); text-decoration: none; }
+.res-chip.auto { border-style: dashed; }
+.res-chip .rc-t { font-weight: 550; }
+.res-chip .rc-h { color: var(--text-3); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.res-chip.add { background: transparent; border-style: dashed; color: var(--text-3); opacity: .6; transition: opacity .12s; }
+.res-chip.add:hover { color: var(--accent); border-color: var(--accent); }
+.rbadge {
+  display: inline-flex; align-items: center; gap: 3px; height: 18px; padding: 0 6px; border-radius: 9px; border: 0; cursor: pointer;
+  background: var(--bg-3); color: var(--text-2); font-size: 11px;
+}
+.rbadge.cur { background: var(--accent-bg); color: var(--accent-text); }
+.rbadge:hover { filter: brightness(0.96); }
+.web-card { display: flex; gap: 12px; align-items: flex-start; }
+.web-card .pc-main { flex: 1; min-width: 0; }
+.web-card .wc-ic { font-size: 20px; line-height: 1; margin-top: 2px; flex: none; }
+.web-card .wc-desc { font-size: 12.5px; color: var(--text-2); margin-top: 5px; line-height: 1.5; }
+.kind-tag { font-size: 11px; padding: 0 6px; border-radius: 4px; background: var(--bg-3); color: var(--text-2); }
+.card:hover .res-chip.add { opacity: 1; }
+
+/* ---------- 文章 / README 阅读器 ---------- */
+.article-scroll { position: absolute; inset: 0; overflow: auto; background: var(--bg); }
+.article-scroll.iframe-mode { overflow: hidden; }
+.article-view, .readme-view, .video-view, .notice-view {
+  --article-scale: 1;
+  max-width: 760px; margin: 0 auto; padding: 34px 40px 40vh;
+}
+.article-view .article-body, .readme-view .article-body {
+  font-family: var(--serif); font-size: calc(17px * var(--article-scale)); line-height: 1.78; color: var(--text);
+}
+.readme-view .article-body { font-family: var(--font); font-size: calc(15px * var(--article-scale)); line-height: 1.7; }
+.article-body p { margin: 0.85em 0; }
+.article-body h1, .article-body h2, .article-body h3, .article-body h4 { font-family: var(--font); line-height: 1.3; margin: 1.6em 0 0.55em; }
+.article-body h1 { font-size: 1.55em; } .article-body h2 { font-size: 1.3em; } .article-body h3 { font-size: 1.12em; } .article-body h4 { font-size: 1em; }
+.article-body img { display: block; max-width: 100%; height: auto; margin: 1.1em auto; border-radius: 6px; }
+.article-body img.img-broken { display: none; }
+.article-body figure { margin: 1.3em 0; }
+.article-body figcaption { font-family: var(--font); font-size: 0.82em; color: var(--text-3); text-align: center; margin-top: 0.4em; }
+.article-body pre { font-size: 0.8em; line-height: 1.55; font-family: var(--mono); }
+.article-body code { font-size: 0.86em; }
+.article-body blockquote { font-size: 0.97em; }
+.article-body ul, .article-body ol { padding-left: 1.5em; }
+.article-body li { margin: 0.3em 0; }
+.article-body table { font-family: var(--font); font-size: 0.85em; }
+.article-body a { text-decoration: underline; text-decoration-color: color-mix(in srgb, var(--accent) 35%, transparent); text-underline-offset: 2px; }
+.article-body .math-display { overflow-x: auto; overflow-y: hidden; margin: 1em 0; text-align: center; }
+.article-body .katex { font-size: 1.05em; }
+.av-head { margin-bottom: 22px; padding-bottom: 16px; border-bottom: 1px solid var(--border); }
+.av-site { display: flex; align-items: center; gap: 6px; font-size: 12.5px; color: var(--text-3); margin-bottom: 8px; }
+.av-site .av-dot { color: var(--border-2); }
+.av-title { font-family: var(--serif); font-size: 30px; line-height: 1.25; margin: 0 0 10px; font-weight: 650; letter-spacing: -0.01em; }
+.readme-view .av-title { font-family: var(--mono); font-size: 24px; }
+.av-desc { font-size: 15px; color: var(--text-2); margin: 0 0 10px; }
+.av-meta { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 16px; font-size: 13px; color: var(--text-2); }
+.av-meta a { display: inline-flex; align-items: center; gap: 4px; }
+.weak-banner {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin: -6px 0 18px; padding: 8px 12px; border-radius: 8px;
+  background: var(--warn-bg); color: var(--warn); font-size: 12.5px;
+}
+.notice-view { padding-top: 60px; }
+.notice-msg { color: var(--text-2); font-size: 14px; margin: 6px 0 16px; line-height: 1.6; }
+.notice-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 22px; }
+.notice-list { border-top: 1px solid var(--border); padding-top: 12px; display: flex; flex-direction: column; gap: 8px; }
+.notice-list .alist-item.static { cursor: default; }
+.video-view { max-width: 980px; }
+.video-box { position: relative; width: 100%; aspect-ratio: 16 / 9; background: #000; border-radius: 10px; overflow: hidden; box-shadow: var(--shadow); }
+.video-box iframe { position: absolute; inset: 0; width: 100%; height: 100%; border: 0; }
+.video-foot { display: flex; align-items: center; gap: 10px; margin-top: 12px; font-size: 12.5px; }
+.rd-loading .bar.indeterminate i { width: 35%; animation: pdslide 1.1s ease-in-out infinite; }
+@keyframes pdslide { 0% { transform: translateX(-100%); } 100% { transform: translateX(300%); } }
+
+/* 文章里的标注：<mark class="anno anno-<kind> c-<color>"> */
+.article-body mark.anno { position: static; color: inherit; background: transparent; padding: 0; border-radius: 2px; cursor: pointer;
+  -webkit-box-decoration-break: clone; box-decoration-break: clone; mix-blend-mode: normal; }
+.article-body mark.anno::after { content: none; }
+.article-body mark.anno-highlight.c-yellow { background: rgba(255, 210, 0, 0.42); }
+.article-body mark.anno-highlight.c-green { background: rgba(92, 200, 110, 0.36); }
+.article-body mark.anno-highlight.c-blue { background: rgba(80, 155, 255, 0.32); }
+.article-body mark.anno-highlight.c-pink { background: rgba(255, 100, 160, 0.3); }
+.article-body mark.anno-highlight.c-purple { background: rgba(160, 110, 255, 0.3); }
+.article-body mark.anno-underline { text-decoration: underline; text-decoration-color: var(--lc); text-decoration-thickness: 2px; text-underline-offset: 3px; }
+.article-body mark.anno-strike { text-decoration: line-through; text-decoration-color: var(--lc); text-decoration-thickness: 1.7px; }
+.article-body mark.anno-squiggly { text-decoration: underline wavy; text-decoration-color: var(--lc); text-decoration-thickness: 1.3px; text-underline-offset: 3px; }
+.article-body mark.anno-vocab { background: rgba(160, 110, 255, 0.1); text-decoration: underline dotted #8a5cf0; text-decoration-thickness: 2.2px; text-underline-offset: 4px; }
+.article-body mark.anno.has-note::after { content: "💬"; position: static; display: inline; background: none; border: 0; height: auto; width: auto; font-size: 0.62em; vertical-align: super; margin-left: 1px; text-decoration: none; }
+.article-body mark.anno.flash { animation: markflash 0.55s ease-in-out 0s 4; }
+@keyframes markflash { 0%, 100% { box-shadow: 0 0 0 0 rgba(47, 95, 179, 0); } 50% { box-shadow: 0 0 0 3px rgba(47, 95, 179, 0.5); background-color: rgba(80, 155, 255, 0.28); } }
+::highlight(pd-tts) { background-color: rgba(255, 196, 0, 0.4); }
+::highlight(pd-flash) { background-color: rgba(80, 155, 255, 0.35); }
+.article-body .tts-cur-block { background: rgba(255, 196, 0, 0.15); border-radius: 4px; }
+@media (prefers-color-scheme: dark) {
+  .article-body mark.anno-highlight.c-yellow { background: rgba(255, 210, 0, 0.3); }
+  .article-body mark.anno-highlight.c-green { background: rgba(92, 200, 110, 0.28); }
+  .article-body mark.anno-highlight.c-blue { background: rgba(80, 155, 255, 0.28); }
+  .article-body mark.anno-highlight.c-pink { background: rgba(255, 100, 160, 0.26); }
+  .article-body mark.anno-highlight.c-purple { background: rgba(160, 110, 255, 0.28); }
+}
+@media (max-width: 1100px) {
+  .article-view, .readme-view, .video-view, .notice-view { padding-left: 24px; padding-right: 24px; }
+}

@@ -60,6 +60,8 @@ export class Audiobook {
       try { saved = JSON.parse(localStorage.getItem(`pd.ttspos.${ctx.pid}.${ctx.iid}`) || 'null') || saved; } catch { /* ignore */ }
     }
     this.pos = saved ? { page: saved.page || 1, s: saved.sentence || 0 } : null;
+    this.mainPos = this.pos;
+    this._scrollEl = null;
     this.current = null; // {page, s, item, total}
     this.listeners = new Set();
     this.sections = null;
@@ -81,10 +83,38 @@ export class Audiobook {
   }
 
   onDocReady() {
-    const el = this.ctx.pdf.scrollEl;
-    el.addEventListener('wheel', this._onUserScroll, { passive: true });
-    el.addEventListener('touchmove', this._onUserScroll, { passive: true });
+    this._attach();
     this._emit();
+  }
+
+  _attach() {
+    const el = this.ctx.pdf && this.ctx.pdf.scrollEl;
+    if (el === this._scrollEl) return;
+    if (this._scrollEl) {
+      this._scrollEl.removeEventListener('wheel', this._onUserScroll);
+      this._scrollEl.removeEventListener('touchmove', this._onUserScroll);
+    }
+    this._scrollEl = el || null;
+    if (el) {
+      el.addEventListener('wheel', this._onUserScroll, { passive: true });
+      el.addEventListener('touchmove', this._onUserScroll, { passive: true });
+    }
+  }
+
+  /** 阅读页切换了资源（PDF ↔ 文章 ↔ README …）：清空缓存，位置只对主资源记忆 */
+  resetView(isMain) {
+    this.stop();
+    this.pageCache.clear();
+    this.lineKeyCache.clear();
+    this.sections = null;
+    this.current = null;
+    this.pos = isMain ? this.mainPos : null;
+    this._attach();
+    this._emit();
+  }
+
+  get isArticle() {
+    return !!(this.ctx.pdf && this.ctx.pdf.isArticle);
   }
 
   on(fn) {
@@ -144,6 +174,12 @@ export class Audiobook {
   /** 构建一页的朗读条目：[{text, lang, kind:'text'|'heading'|'formula', spans:[HTMLElement]}] */
   async buildPage(num) {
     if (this.pageCache.has(num)) return this.pageCache.get(num);
+    const view = this.ctx.pdf;
+    if (view && view.buildReadItems) {
+      const res = await view.buildReadItems(num, this.opts);
+      this.pageCache.set(num, res);
+      return res;
+    }
     const textEl = await this.ctx.pdf.ensureText(num);
     const raw = [];
     let cur = [];
@@ -318,7 +354,12 @@ export class Audiobook {
     return this.playFrom(1, 0);
   }
 
-  playFromCurrentPage() {
+  async playFromCurrentPage() {
+    const view = this.ctx.pdf;
+    if (view && view.isArticle && view.firstVisibleIndex) {
+      const pg = await this.buildPage(1);
+      return this.playFrom(1, view.firstVisibleIndex(pg.items));
+    }
     return this.playFrom(this.ctx.currentPage(), 0);
   }
 
@@ -326,7 +367,7 @@ export class Audiobook {
     const sel = window.getSelection();
     const text = sel && !sel.isCollapsed ? sel.toString().trim() : '';
     if (!text) {
-      toast('先在 PDF 里选中一段文字', 'info');
+      toast('先在文中选中一段文字', 'info');
       return;
     }
     this.stop();
@@ -422,6 +463,12 @@ export class Audiobook {
   // ---------------- 高亮 / 跟随 ----------------
   _highlight(it, page) {
     this._clearHighlight();
+    const view = this.ctx.pdf;
+    if (view && view.highlightReadItem) {
+      this._hlView = view.view || view;
+      view.highlightReadItem(it, { follow: Date.now() >= this.followPausedUntil });
+      return;
+    }
     this.highlighted = it.spans || [];
     for (const sp of this.highlighted) sp.classList.add('tts-cur');
     if (Date.now() < this.followPausedUntil) return;
@@ -439,6 +486,10 @@ export class Audiobook {
   }
 
   _clearHighlight() {
+    if (this._hlView) {
+      try { this._hlView.clearReadHighlight(); } catch { /* ignore */ }
+      this._hlView = null;
+    }
     for (const sp of this.highlighted) sp.classList.remove('tts-cur');
     this.highlighted = [];
   }
@@ -468,6 +519,8 @@ export class Audiobook {
   // ---------------- 位置记忆 ----------------
   _savePos(force = false) {
     if (!this.pos) return;
+    if (this.ctx.resource && this.ctx.resource !== 'main') return;
+    this.mainPos = this.pos;
     const now = Date.now();
     if (!force && now - this._lastSave < 5000) return;
     this._lastSave = now;
@@ -480,6 +533,12 @@ export class Audiobook {
   // ---------------- 章节 ----------------
   async getSections() {
     if (this.sections) return this.sections;
+    const view = this.ctx.pdf;
+    if (view && view.isArticle && view.getSections) {
+      this.sections = await view.getSections();
+      return this.sections;
+    }
+    if (!view || !view.doc) return [];
     const out = [];
     const doc = this.ctx.pdf.doc;
     try {
@@ -526,7 +585,7 @@ export class Audiobook {
         if (i >= 0) s = i;
       } catch { /* ignore */ }
     }
-    this.ctx.pdf.scrollToPage(sec.page);
+    if (!this.isArticle) this.ctx.pdf.scrollToPage(sec.page);
     return this.playFrom(sec.page, s);
   }
 
@@ -576,9 +635,10 @@ export class Audiobook {
     this._savePos(true);
     this._ttsOff && this._ttsOff();
     try {
-      const el = this.ctx.pdf && this.ctx.pdf.scrollEl;
+      const el = this._scrollEl;
       el && el.removeEventListener('wheel', this._onUserScroll);
       el && el.removeEventListener('touchmove', this._onUserScroll);
+      this._scrollEl = null;
     } catch { /* ignore */ }
     if (this._audio) {
       this._audio.pause();
@@ -645,7 +705,8 @@ export function createTtsBar(ctx) {
     secSel.options[0].textContent = '正在读取目录…';
     const secs = await book.getSections();
     secSel.options[0].textContent = secs.length ? '目录…' : '（没有检测到章节）';
-    secs.forEach((s, i) => secSel.append(h('option', { value: String(i) }, `${s.depth ? '　' : ''}${s.title.slice(0, 50)} · p.${s.page}`)));
+    const art = book.isArticle;
+    secs.forEach((s, i) => secSel.append(h('option', { value: String(i) }, `${s.depth ? '　' : ''}${s.title.slice(0, 50)}${art ? '' : ` · p.${s.page}`}`)));
   });
   secSel.onchange = async () => {
     if (secSel.value === '') return;
@@ -673,29 +734,35 @@ export function createTtsBar(ctx) {
   const update = (ev = {}) => {
     const n = book.numPages;
     const p = book.pos;
-    if (p && p.page) {
+    const art = book.isArticle;
+    if (p && p.page && (p.page > 1 || p.s > 0)) {
       resumeBtn.style.display = '';
-      resumeBtn.textContent = `▶ 从上次位置（p.${p.page}）`;
+      resumeBtn.textContent = art ? `▶ 从上次位置（第 ${p.s + 1} 句）` : `▶ 从上次位置（p.${p.page}）`;
     } else resumeBtn.style.display = 'none';
     if (book.playing) {
       playPause.textContent = book.paused ? '▶' : '⏸';
       const tot = book.current ? book.current.total : 0;
-      if (p) progLabel.textContent = `第 ${p.page}/${n} 页 · 第 ${p.s + 1}${tot ? '/' + tot : ''} 句`;
+      if (p) progLabel.textContent = art ? `第 ${p.s + 1}${tot ? '/' + tot : ''} 句` : `第 ${p.page}/${n} 页 · 第 ${p.s + 1}${tot ? '/' + tot : ''} 句`;
       else progLabel.textContent = '准备中…';
     } else {
       playPause.textContent = '▶';
-      if (p && n) progLabel.textContent = `停在第 ${p.page}/${n} 页 · 第 ${p.s + 1} 句`;
+      if (p && n) progLabel.textContent = art ? `停在第 ${p.s + 1} 句` : `停在第 ${p.page}/${n} 页 · 第 ${p.s + 1} 句`;
+      else progLabel.textContent = '未开始';
     }
+    fullBtn.title = art ? '从头一直读到最后' : '从第 1 页一直读到最后（默认跳过参考文献）';
+    curBtn.textContent = art ? '从当前位置' : '从当前页';
     if (!dragging) progress.value = String(Math.round(book.progress() * 1000));
     if (ev.sentence) now.textContent = ev.translation ? `${ev.sentence}　→　${ev.translation}` : ev.sentence;
     if (ev.ended) now.textContent = '读完了';
   };
   const offBook = book.on(update);
 
+  const fullBtn = btnA('tts-full', '▶ 听整篇', '从第 1 页一直读到最后（默认跳过参考文献）', () => book.playFrom(1, 0));
+  const curBtn = btn('从当前页', '从当前页 / 当前位置开始读', () => book.playFromCurrentPage());
   const el = h('div', { class: 'tts-bar' },
-    btnA('tts-full', '▶ 听整篇', '从第 1 页一直读到最后（默认跳过参考文献）', () => book.playFrom(1, 0)),
+    fullBtn,
     resumeBtn,
-    btn('从当前页', '从当前页开头开始读', () => book.playFromCurrentPage()),
+    curBtn,
     btn('读选区', '只读选中的文字', () => book.playSelection()),
     h('span', { class: 'tb-sep' }),
     btn('⏮', '上一句 (J)', () => book.prev(), 'icon-btn'),
@@ -713,6 +780,11 @@ export function createTtsBar(ctx) {
   update();
   return {
     el,
+    reset() {
+      secSel.replaceChildren(h('option', { value: '' }, '目录…'));
+      now.textContent = tts.supported ? '选择「听整篇」或「从当前位置」开始；快捷键 K 播放/暂停，J/L 上一句/下一句' : '这个浏览器不支持朗读（speechSynthesis）';
+      update();
+    },
     destroy() { offBook(); offVoices(); },
   };
 }

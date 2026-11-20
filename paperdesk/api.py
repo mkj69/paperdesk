@@ -188,6 +188,52 @@ def h_resolve(app, h, m, q, body):
         raise ApiError(400, str(e))
 
 
+def _fill_resource_titles(app, pid, iid):
+    """后台补全自动发现的论文资源标题（arXiv 元数据），失败忽略。"""
+    def run():
+        try:
+            it = store.find_item(app.data_dir, pid, iid)
+        except Exception:
+            return
+        for r in it.get("resources") or []:
+            if r.get("kind") == "paper" and r.get("arxiv_id") and (r.get("title") or "").startswith("arXiv:"):
+                meta = fetcher.fetch_arxiv_meta(r["arxiv_id"])
+                if meta and meta.get("title"):
+                    try:
+                        store.update_resource(app.data_dir, pid, iid, r["id"], {"title": meta["title"]})
+                    except Exception:
+                        pass
+    threading.Thread(target=run, daemon=True).start()
+
+
+def _resolve_multi(text):
+    """一次粘贴多个链接：主链接取第一个论文类（没有就第一个），其余作为资源。"""
+    parts = fetcher.split_inputs(text)
+    if len(parts) < 2:
+        return fetcher.resolve(text)
+    resolved = []
+    for t in parts:
+        try:
+            resolved.append(fetcher.resolve(t))
+        except ValueError:
+            continue
+    if not resolved:
+        raise ValueError("无法识别输入的链接")
+    main = next((r for r in resolved if r.get("type") == "paper"), resolved[0])
+    res = list(main.get("resources") or [])
+    for r in resolved:
+        if r is main:
+            continue
+        res.append({"kind": r.get("kind") or fetcher.classify(r.get("url") or ""), "url": r.get("url"),
+                    "title": r.get("title") if r.get("title") != r.get("url") else "",
+                    "pdf_url": r.get("pdf_url"), "arxiv_id": r.get("arxiv_id"), "auto": False})
+        for extra in r.get("resources") or []:
+            res.append(extra)
+    main = dict(main)
+    main["resources"] = res
+    return main
+
+
 @route("POST", r"/api/projects/" + ID + r"/items")
 def h_item_add(app, h, m, q, body):
     pid = m.group(1)
@@ -198,7 +244,7 @@ def h_item_add(app, h, m, q, body):
             data = {"type": "note", "title": body.get("title") or "", "note": body["input"]}
         else:
             try:
-                data = fetcher.resolve(body["input"])
+                data = _resolve_multi(body["input"])
             except ValueError as e:
                 raise ApiError(400, str(e))
     elif body.get("type"):
@@ -208,12 +254,61 @@ def h_item_add(app, h, m, q, body):
             data[k] = body[k]
     if data.get("type") == "paper" and body.get("url") and not body.get("input"):
         data.setdefault("pdf_url", body["url"])
-    if data.get("type") == "link" and data.get("url") and not data.get("title"):
+    if data.get("type") in ("web", "link") and data.get("url") and not data.get("title"):
         data["title"] = data["url"]
     try:
-        return store.add_item(app.data_dir, pid, data)
+        item = store.add_item(app.data_dir, pid, data)
     except ValueError as e:
         raise ApiError(400, str(e))
+    if not item.get("existing") and any(r.get("auto") and r.get("kind") == "paper" for r in item.get("resources") or []):
+        _fill_resource_titles(app, pid, item["id"])
+    return item
+
+
+# ----------------------------------------------------------------- 资源（SPEC §13.2）
+@route("POST", r"/api/projects/" + ID + r"/items/" + IID + r"/resources")
+def h_res_add(app, h, m, q, body):
+    pid, iid = m.group(1), m.group(2)
+    url = (_require(body, "url", "请输入资源链接") or "").strip()
+    data = {"url": url, "kind": body.get("kind"), "title": body.get("title") or ""}
+    try:
+        r = fetcher.resolve(url)
+        data["url"] = r.get("url") or url
+        if r.get("type") == "paper" and r.get("pdf_url"):
+            data["pdf_url"] = r["pdf_url"]
+            data["arxiv_id"] = r.get("arxiv_id")
+        if not data["title"] and r.get("title") and r.get("title") != r.get("url"):
+            data["title"] = r["title"]
+        if not data.get("kind"):
+            data["kind"] = r.get("kind") or fetcher.classify(url)
+    except ValueError as e:
+        raise ApiError(400, str(e))
+    except Exception:
+        data["kind"] = data.get("kind") or fetcher.classify(url)
+    return store.add_resource(app.data_dir, pid, iid, data)
+
+
+@route("PATCH", r"/api/projects/" + ID + r"/items/" + IID + r"/resources/" + IID)
+def h_res_patch(app, h, m, q, body):
+    return store.update_resource(app.data_dir, m.group(1), m.group(2), m.group(3), body)
+
+
+@route("DELETE", r"/api/projects/" + ID + r"/items/" + IID + r"/resources/" + IID)
+def h_res_delete(app, h, m, q, body):
+    store.delete_resource(app.data_dir, m.group(1), m.group(2), m.group(3))
+    return {"ok": True}
+
+
+# ----------------------------------------------------------------- 网页正文（不落盘）
+@route("GET", r"/api/web")
+def h_web(app, h, m, q, body):
+    url = (q.get("url") or [""])[0]
+    if not url:
+        raise ApiError(400, "缺少 url 参数")
+    try:
+        return fetcher.fetch_web(url)
+    except fetcher.FetchError as e:
+        raise ApiError(502, "网页加载失败：%s" % e)
 
 
 @route("PATCH", r"/api/projects/" + ID + r"/items/" + IID)
@@ -278,7 +373,9 @@ P = r"/api/papers/" + ID + "/" + IID
 
 def _state_out(app, pid, st):
     out = dict(st)
-    out["text_cached"] = bool(store.read_cached_text(app.data_dir, pid, st["paper_key"]))
+    cached = store.cached_resources(app.data_dir, pid, st["paper_key"])
+    out["text_cached"] = "main" in cached
+    out["texts_cached"] = cached
     out["md_path"] = store.paper_md_relpath(pid, st["paper_key"])
     return out
 
@@ -305,10 +402,21 @@ def h_paper_patch(app, h, m, q, body):
 def h_paper_text(app, h, m, q, body):
     pid, iid = m.group(1), m.group(2)
     it = store.find_item(app.data_dir, pid, iid)
-    if it.get("type") != "paper":
-        raise ApiError(400, "这个条目不是论文")
-    n = store.write_cached_text(app.data_dir, pid, it["paper_key"], body.get("pages") or [])
-    return {"ok": True, "chars": n}
+    if it.get("type") not in store.STATEFUL_TYPES:
+        raise ApiError(400, "这个条目不是论文或网页")
+    if not it.get("paper_key"):
+        store.get_paper_state(app.data_dir, pid, iid)        # 旧 link 条目：补 paper_key
+        it = store.find_item(app.data_dir, pid, iid)
+    rid = body.get("resource_id") or "main"
+    res = next((r for r in store.item_resources(it) if r.get("id") == rid), None)
+    if res is None:
+        raise ApiError(404, "资源不存在：%s" % rid)
+    pages = body.get("pages")
+    if not pages and body.get("text"):
+        pages = [{"page": 1, "text": body["text"]}]
+    n = store.write_cached_text(app.data_dir, pid, it["paper_key"], pages or [], resource_id=rid,
+                                title=body.get("title") or res.get("title"), kind=body.get("kind") or res.get("kind"))
+    return {"ok": True, "chars": n, "resource_id": rid}
 
 
 @route("POST", P + r"/annotations")
@@ -376,7 +484,8 @@ def h_vocab_add(app, h, m, q, body):
     pid, iid = m.group(1), m.group(2)
     word = _require(body, "word", "单词不能为空")
     entry = {"word": word, "context": body.get("context") or "", "page": body.get("page"),
-             "annotation_id": body.get("annotation_id")}
+             "annotation_id": body.get("annotation_id"), "resource_id": body.get("resource_id"),
+             "anchor": body.get("anchor")}
     existing = store.find_vocab(app.data_dir, pid, iid, word)
     if existing is None:
         s = app.settings()
@@ -447,7 +556,8 @@ def h_translate(app, h, m, q, body):
     if body.get("pid") and body.get("iid"):
         try:
             t = store.add_translation(app.data_dir, body["pid"], body["iid"],
-                                      {"source": text, "translation": res, "engine": engine, "page": body.get("page")})
+                                      {"source": text, "translation": res, "engine": engine, "page": body.get("page"),
+                                       "resource_id": body.get("resource_id")})
             out["id"] = t["id"]
         except (store.NotFound, ValueError):
             pass
@@ -485,8 +595,8 @@ def _stream_agent(app, h, pid, iid, engine, prompt, on_done):
     gen = None
     try:
         _sse(h, {"type": "start", "engine": engine})
-        if not store.read_cached_text(app.data_dir, pid, st["paper_key"]):
-            _sse(h, {"type": "status", "text": "提示：论文全文还没抽取完，AI 暂时只能看到摘要"})
+        if not store.cached_resources(app.data_dir, pid, st["paper_key"]):
+            _sse(h, {"type": "status", "text": "提示：全文还没抽取完，AI 暂时只能看到摘要"})
         gen = agents.run_agent(engine, prompt, wd, s, session_id=sid)
         final = None
         for ev in gen:
@@ -531,14 +641,25 @@ def h_ask(app, h, m, q, body):
     s = app.settings()
     engine = body.get("engine") or s.get("default_engine") or "claude"
     style = "voice" if body.get("style") == "voice" else "text"
+    rid = body.get("resource_id") or "main"
+    source_label = None
+    if body.get("quote"):
+        try:
+            it = store.find_item(app.data_dir, pid, iid)
+            res = next((r for r in store.item_resources(it) if r.get("id") == rid), None)
+            if res is not None and (rid != "main" or it.get("type") in ("web", "link")):
+                source_label = agents.resource_label(res)
+        except store.NotFound:
+            pass
     prompt = agents.build_ask_prompt(question, body.get("quote"), body.get("page"), mode, style,
-                                     s.get("answer_lang") or "中文")
+                                     s.get("answer_lang") or "中文", source_label=source_label)
 
     def done(final):
         qa = store.add_qa(app.data_dir, pid, iid, {
             "question": question or ("解释：" + (body.get("quote") or "")[:60]),
             "answer": final["text"], "engine": engine, "mode": mode, "style": style,
-            "quote": body.get("quote") or "", "page": body.get("page")})
+            "quote": body.get("quote") or "", "page": body.get("page"), "resource_id": rid,
+            "anchor": body.get("anchor")})
         return {"type": "done", "qa": qa}
     return _stream_agent(app, h, pid, iid, engine, prompt, done)
 

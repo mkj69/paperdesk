@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>Skimming, explained: how a transformer learns where to read | The Long Context Notebook</title>
+<meta property="og:site_name" content="The Long Context Notebook"><meta name="author" content="Jane Doe">
+<style>body{font-family:Georgia,serif;margin:0} nav,footer,aside{background:#eee;padding:12px}</style></head>
+<body>
+<nav class="site-nav"><a href="/">Home</a> · <a href="/archive">Archive</a> · <a href="/about">About</a> · <a href="/subscribe">Subscribe</a></nav>
+<div class="layout">
+<aside class="sidebar"><h3>Popular posts</h3><ul><li><a href="/p/1">Why context length matters</a></li><li><a href="/p/2">Attention, visually</a></li></ul><div class="newsletter">Join 2,000 readers — subscribe!</div></aside>
+<article class="post">
+<h1>Skimming, explained: how a transformer learns where to read</h1>
+<p class="byline">By Jane Doe · November 2026 · 6 min read</p>
+<p>When you read a long paper, you do not give every sentence the same attention. You skim the related work, slow down at the method, and come back to the key equation more than once. This post is a gentle walk through our paper <em>Learning to Skim</em>, which teaches a transformer to do something similar.</p>
+<h2>The problem: uniform compute</h2>
+<p>A standard transformer spends the same amount of computation on every token. For a 32k-token document, most of that work is wasted on boilerplate: author lists, citations, and repeated headers. Static sparsity patterns help, but they cannot know in advance which parts of <strong>this particular document</strong> matter.</p>
+<h2>The idea: a learned budget per token</h2>
+<p>Skimmer adds a tiny controller that predicts a budget $b_i \in [0, 1]$ for each token. The attention logits are scaled by the budgets of the query and the key, so a token with a low budget barely participates:</p>
+<p>$$\alpha_{ij} \propto \exp\big(b_i b_j \, q_i^\top k_j / \sqrt{d_k}\big)$$</p>
+<figure><img data-src="figure.svg" src="data:image/gif;base64,R0lGODlhAQABAAAAACw=" alt="Budgets are high on definitions and key results, low on references"><figcaption>Learned budgets: high on definitions and results, low on references and boilerplate.</figcaption></figure>
+<p>In code, the controller is only a few lines:</p>
+<pre><code class="language-python">budget = torch.sigmoid(self.proj(h))          # (batch, n, 1)
+logits = (q @ k.transpose(-1, -2)) / math.sqrt(d_k)
+logits = logits * budget * budget.transpose(-1, -2)
+attn = logits.softmax(dim=-1)</code></pre>
+<h2>What we found</h2>
+<p>On four long-document benchmarks, Skimmer stays within 0.3 points of full attention while using only 38% of the attention FLOPs. More interesting than the number is <em>where</em> the budget goes: definitions, numerical results, and the sentences that answers come from.</p>
+<blockquote>The model learns to read like a careful reviewer: fast through the boilerplate, slow where it counts.</blockquote>
+<p>The code and checkpoints are on GitHub, and the paper has all the details, including the limitations we are still working on.</p>
+</article>
+</div>
+<section class="comments"><h3>12 comments</h3><p>Great post! — reader42</p></section>
+<footer class="site-footer">© 2026 The Long Context Notebook · <a href="/rss">RSS</a> · <a href="/privacy">Privacy</a></footer>
+</body></html>

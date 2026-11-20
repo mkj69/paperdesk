@@ -4,6 +4,7 @@ import { h, icon, toast, toastError, confirmDialog, promptDialog, popMenu, copyT
 import { setMarkdown } from './markdown.js';
 import { createEditor } from './editor.js';
 import { refreshProjects, getProjects, navigate } from '../app.js';
+import { resChip, KIND_OPTIONS, kindMeta, hostOf, classifyUrl } from './resources.js';
 
 export async function mountProject(root, pid) {
   const page = h('div', { class: 'page' });
@@ -56,7 +57,7 @@ export async function mountProject(root, pid) {
   }
 
   // ---------- 添加栏 ----------
-  const input = h('input', { type: 'text', placeholder: '粘贴 arXiv ID / arXiv 链接 / PDF 链接 / 任意网页链接，回车添加' });
+  const input = h('input', { type: 'text', placeholder: '粘贴 arXiv / PDF / 博客 / GitHub 链接，回车添加（多个链接一起粘贴 = 同一篇工作）' });
   const addBtn = h('button', { class: 'btn btn-primary btn-sm' }, '添加');
   const noteBtn = h('button', { class: 'btn btn-sm' }, icon('note', 14), '写一条笔记');
   const add = async () => {
@@ -122,7 +123,7 @@ export async function mountProject(root, pid) {
   function renderList() {
     const items = (project.items || []).slice().sort((a, b) => (b.added || '').localeCompare(a.added || ''));
     const papers = items.filter((i) => i.type === 'paper');
-    const links = items.filter((i) => i.type === 'link');
+    const links = items.filter((i) => i.type === 'web' || i.type === 'link');
     const notes = items.filter((i) => i.type === 'note');
     listEl.replaceChildren();
     if (!items.length) {
@@ -134,8 +135,8 @@ export async function mountProject(root, pid) {
       listEl.append(h('div', { class: 'cards' }, papers.map(paperCard)));
     }
     if (links.length) {
-      listEl.append(h('div', { class: 'section-title' }, icon('link', 14), '链接', h('span', { class: 'count' }, links.length)));
-      listEl.append(h('div', { class: 'cards' }, links.map(linkCard)));
+      listEl.append(h('div', { class: 'section-title' }, icon('link', 14), '网页 / 博客 / 代码', h('span', { class: 'count' }, links.length)));
+      listEl.append(h('div', { class: 'cards' }, links.map(webCard)));
     }
     if (notes.length) {
       listEl.append(h('div', { class: 'section-title' }, icon('note', 14), '笔记', h('span', { class: 'count' }, notes.length)));
@@ -166,10 +167,12 @@ export async function mountProject(root, pid) {
 
   function itemMenu(btn, it) {
     const others = getProjects().filter((p) => p.id !== pid);
+    const readable = it.type === 'paper' || it.type === 'web' || it.type === 'link';
     popMenu(btn, [
-      ...(it.type === 'paper' ? [
+      ...(readable ? [
         { label: '阅读', icon: 'book', onClick: () => navigate(readPath(it)) },
         { label: '复制阅读链接', icon: 'copy', onClick: () => copyText(readerUrl(pid, it.id)) },
+        ...(STATIC ? [] : [{ label: '关联资源（代码 / 主页 / 博客…）', icon: 'plus', onClick: () => addResource(it) }]),
       ] : []),
       ...(it.url ? [{ label: '打开原文链接', icon: 'external', onClick: () => window.open(it.url, '_blank') }] : []),
       ...(STATIC ? [] : [
@@ -214,7 +217,7 @@ export async function mountProject(root, pid) {
   }
 
   async function removeItem(it) {
-    const extra = it.type === 'paper' ? '它的笔记文件会移到 .trash。' : '';
+    const extra = it.type === 'paper' || it.type === 'web' ? '它的笔记文件会移到 .trash。' : '';
     if (!(await confirmDialog(`删除「${truncate(it.title || it.url || '笔记', 50)}」？${extra}`, { danger: true, okText: '删除' }))) return;
     try {
       await del(`/projects/${P}/items/${encodeURIComponent(it.id)}`);
@@ -223,11 +226,41 @@ export async function mountProject(root, pid) {
     } catch (e) { toastError(e); }
   }
 
+  async function addResource(it) {
+    const r = await promptDialog({
+      title: `关联资源 · ${truncate(it.title || it.url || '', 40)}`,
+      fields: [
+        { name: 'url', label: '链接', placeholder: 'https://github.com/…  或项目主页 / 博客 / 视频 / arXiv', hint: '同一篇工作的论文、代码、主页、博客、视频都可以存在一起，阅读页顶部可以切换' },
+        { name: 'kind', label: '类型', type: 'select', options: KIND_OPTIONS, value: '' },
+        { name: 'title', label: '标题（可选）', placeholder: '留空则自动获取' },
+      ],
+      okText: '关联',
+    });
+    if (!r || !r.url.trim()) return;
+    const body = { url: r.url.trim() };
+    if (r.kind) body.kind = r.kind;
+    if (r.title.trim()) body.title = r.title.trim();
+    try {
+      const res = await post(`/projects/${P}/items/${encodeURIComponent(it.id)}/resources`, body);
+      const entry = res.resource || res;
+      toast(`已关联：${kindMeta(entry.kind).label} · ${hostOf(entry.url)}`, 'ok');
+      await reload();
+    } catch (e) { toastError(e); }
+  }
+
+  function resRow(it) {
+    const rs = (it.resources || []).filter((r) => r && r.url);
+    if (!rs.length && STATIC) return null;
+    return h('div', { class: 'res-chips' },
+      rs.map((r) => resChip(r)),
+      STATIC ? null : h('button', { class: 'res-chip add', 'data-action': 'add-resource', title: '关联代码 / 主页 / 博客 / 视频…', onclick: (e) => { e.stopPropagation(); addResource(it); } }, icon('plus', 12), rs.length ? '' : '关联资源'));
+  }
+
   function paperCard(it) {
     const authors = it.authors && it.authors.length ? (it.authors.length > 3 ? `${it.authors.slice(0, 3).join(', ')} 等` : it.authors.join(', ')) : '';
     const more = h('button', { class: 'icon-btn', title: '更多' }, icon('dots', 16));
     more.onclick = (e) => { e.stopPropagation(); itemMenu(more, it); };
-    return h('div', { class: 'card paper-card' },
+    return h('div', { class: 'card paper-card', dataset: { itemType: 'paper' } },
       h('div', { class: 'pc-main' },
         h('a', { class: 'pc-title', href: readHref(it), 'data-link': '' }, it.title || it.url),
         h('div', { class: 'pc-meta' },
@@ -236,26 +269,38 @@ export async function mountProject(root, pid) {
           it.year ? h('span', {}, it.year) : null,
           it.arxiv_id ? h('span', { class: 'faint' }, `arXiv:${it.arxiv_id}`) : null,
           (it.tags || []).map((t) => h('span', { class: 'tag' }, t)),
-          h('span', { class: 'faint' }, `添加于 ${fmtTime(it.added)}`))),
+          h('span', { class: 'faint' }, `添加于 ${fmtTime(it.added)}`)),
+        resRow(it)),
       h('div', { class: 'pc-actions' },
         h('a', { class: 'btn btn-sm', href: readHref(it), 'data-link': '' }, icon('book', 14), '阅读'),
         h('button', { class: 'icon-btn', title: '复制阅读链接', onclick: () => copyText(readerUrl(pid, it.id)) }, icon('link', 15)),
         more));
   }
 
-  function linkCard(it) {
-    let host = '';
-    try { host = new URL(it.url).host; } catch { /* ignore */ }
+  function webCard(it) {
+    const host = hostOf(it.url);
+    const kind = it.kind || classifyUrl(it.url || '');
+    const km = kindMeta(kind);
     const more = h('button', { class: 'icon-btn', title: '更多' }, icon('dots', 16));
-    more.onclick = () => itemMenu(more, it);
-    if (STATIC) more.style.display = 'none';
-    return h('div', { class: 'card link-card' },
-      icon('external', 16),
-      h('div', { class: 'lc-main' },
-        h('a', { class: 'lc-title', href: it.url, target: '_blank', rel: 'noopener' }, it.title || it.url),
-        h('div', { class: 'lc-url' }, host ? `${host} · ${it.url}` : it.url),
-        (it.tags || []).length ? h('div', { class: 'pc-meta' }, it.tags.map((t) => h('span', { class: 'tag' }, t))) : null),
-      h('div', { class: 'pc-actions' }, more));
+    more.onclick = (e) => { e.stopPropagation(); itemMenu(more, it); };
+    const desc = it.description || it.abstract || '';
+    return h('div', { class: 'card web-card', dataset: { itemType: 'web' } },
+      h('div', { class: 'wc-ic', title: km.label }, km.icon),
+      h('div', { class: 'pc-main' },
+        h('a', { class: 'pc-title', href: readHref(it), 'data-link': '' }, it.title || it.url),
+        h('div', { class: 'pc-meta' },
+          it.type === 'link' ? null : statusBadge(it),
+          h('span', { class: 'kind-tag' }, km.label),
+          h('span', {}, it.site_name || host),
+          (it.tags || []).map((t) => h('span', { class: 'tag' }, t)),
+          h('span', { class: 'faint' }, `添加于 ${fmtTime(it.added)}`)),
+        desc ? h('div', { class: 'wc-desc' }, truncate(desc, 180)) : null,
+        resRow(it)),
+      h('div', { class: 'pc-actions' },
+        h('a', { class: 'btn btn-sm', href: readHref(it), 'data-link': '' }, icon('book', 14), '阅读'),
+        h('a', { class: 'icon-btn', title: '在新标签页打开原网页', href: it.url, target: '_blank', rel: 'noopener' }, icon('external', 15)),
+        h('button', { class: 'icon-btn', title: '复制阅读链接', onclick: () => copyText(readerUrl(pid, it.id)) }, icon('link', 15)),
+        STATIC ? null : more));
   }
 
   function noteCard(it) {

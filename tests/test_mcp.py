@@ -123,7 +123,7 @@ class MCPTest(unittest.TestCase):
         names = {p["name"] for p in data["projects"]}
         self.assertIn("ML 阅读", names)
         ml = [p for p in data["projects"] if p["id"] == self.pid][0]
-        self.assertEqual(ml["counts"], {"paper": 1, "link": 1, "note": 1})
+        self.assertEqual(ml["counts"], {"paper": 1, "web": 0, "link": 1, "note": 1})
 
         txt, err = self.c.call("list_items", {"project": "ML 阅读"})
         self.assertFalse(err)

@@ -1,0 +1,70 @@
+\documentclass[10pt,twocolumn]{article}
+\usepackage[margin=0.75in]{geometry}
+\usepackage{amsmath,amssymb,booktabs,times}
+\usepackage[hidelinks]{hyperref}
+\title{\Large\bfseries Learning to Skim: Adaptive Token Budgets\\for Long-Document Transformers}
+\author{Jane Doe$^{1}$ \quad John Smith$^{2}$ \quad Mei Lin$^{1}$\\[2pt]
+{\small $^{1}$Example University \quad $^{2}$Demo Research Lab}}
+\date{}
+\begin{document}
+\maketitle
+\begin{abstract}
+Transformers spend the same amount of computation on every token, even when most of a long document is redundant for the question at hand. We introduce \emph{Skimmer}, a lightweight controller that assigns each token a learned budget and lets the model skim low-value spans while reading salient spans in full. Skimmer is trained end-to-end with a differentiable relaxation of the budget constraint. On four long-document benchmarks it matches full-attention accuracy while using 38\% of the attention FLOPs, and it degrades gracefully as the budget shrinks.
+\end{abstract}
+
+\section{Introduction}
+Reading a long paper rarely means reading every sentence with equal care. Human readers skim the related work, slow down at the method, and return to a key equation several times. Standard transformers, in contrast, allocate a uniform amount of computation to each token, so the cost of self-attention grows quadratically with document length regardless of where the information actually lies.
+
+Prior work reduces this cost with fixed sparsity patterns, low-rank projections, or retrieval over chunks. These methods are effective but \emph{static}: the pattern does not depend on the content being read. We ask a simple question: can a model learn \emph{where} to spend its budget?
+
+Our contributions are threefold. First, we formulate token-level budgeting as a constrained optimization problem and derive a differentiable surrogate. Second, we design Skimmer, a controller with fewer than 1\% additional parameters. Third, we show that the learned budgets are interpretable: they concentrate on definitions, numbers, and the sentences that answers are drawn from.
+
+\section{Method}
+\subsection{Budgeted attention}
+Let $x_{1:n}$ be the input tokens and $h_i$ the hidden state of token $i$. Skimmer predicts a budget $b_i \in [0,1]$ with a small MLP, $b_i = \sigma(w^\top h_i + c)$. Attention logits are rescaled by the budgets of both the query and the key:
+\begin{equation}
+\alpha_{ij} = \frac{\exp\!\big(b_i b_j \, q_i^\top k_j / \sqrt{d_k}\big)}{\sum_{l} \exp\!\big(b_i b_l \, q_i^\top k_l / \sqrt{d_k}\big)}.
+\end{equation}
+Tokens whose budget falls below a threshold $\tau$ are routed to a cheap pooled summary instead of full attention, which is where the savings come from.
+
+\subsection{Training objective}
+We minimize the task loss subject to an average budget $\bar b = \frac{1}{n}\sum_i b_i \le B$. Using a Lagrangian relaxation,
+\begin{equation}
+\mathcal{L} = \mathcal{L}_{\text{task}} + \lambda \max(0, \bar b - B) + \beta \sum_i b_i (1-b_i),
+\end{equation}
+where the last term pushes budgets toward $0$ or $1$ so that the hard threshold at inference time matches training.
+
+\section{Experiments}
+We evaluate on four long-document tasks with inputs of 8k--32k tokens. Table~\ref{tab:main} compares Skimmer with full attention and two static sparse baselines at a matched compute budget.
+
+\begin{table}[t]
+\centering\small
+\begin{tabular}{lccc}
+\toprule
+Method & Accuracy & FLOPs & Latency \\
+\midrule
+Full attention & 71.4 & 100\% & 1.00$\times$ \\
+Sliding window & 66.2 & 35\% & 0.41$\times$ \\
+Chunk retrieval & 68.9 & 40\% & 0.47$\times$ \\
+\textbf{Skimmer (ours)} & \textbf{71.1} & \textbf{38\%} & \textbf{0.44$\times$} \\
+\bottomrule
+\end{tabular}
+\caption{Average results over four benchmarks.}
+\label{tab:main}
+\end{table}
+
+Skimmer stays within 0.3 points of full attention while using 38\% of its FLOPs. As the budget $B$ shrinks from 0.6 to 0.2, accuracy decreases smoothly rather than collapsing, which suggests that the controller learns a meaningful ranking of tokens rather than a brittle mask.
+
+\paragraph{What does the model skim?} Budgets are lowest on boilerplate such as citations, author lists, and repeated headers, and highest on definitions, numerical results, and sentences that contain the answer span. This mirrors how careful human readers allocate attention.
+
+\section{Limitations}
+The controller is trained per task, and budgets learned for question answering do not transfer perfectly to summarization. The pooled summary path also adds a small constant overhead that dominates for short inputs.
+
+\section{Conclusion}
+Skimmer shows that a transformer can learn where to read carefully. Adaptive budgets are a simple and interpretable way to make long-document models cheaper without giving up accuracy.
+
+\begin{thebibliography}{9}\small
+\bibitem{a} A. Author. Efficient attention for long inputs. \emph{Demo Proceedings}, 2024.
+\bibitem{b} B. Writer. Retrieval over chunks. \emph{Example Workshop}, 2025.
+\end{thebibliography}
+\end{document}

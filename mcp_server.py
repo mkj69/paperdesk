@@ -213,10 +213,13 @@ def simple_resolve(text):
 def tool_list_projects(_args):
     out = []
     for p in all_projects():
-        counts = {"paper": 0, "link": 0, "note": 0}
+        counts = {"paper": 0, "web": 0, "link": 0, "note": 0}
         for it in p.get("items") or []:
             t = it.get("type")
-            if t in counts:
+            if t == "web":
+                counts["web"] += 1
+                counts["link"] += 1
+            elif t in counts:
                 counts[t] += 1
         out.append({"id": p.get("id"), "name": p.get("name"), "description": p.get("description", ""),
                     "counts": counts, "updated": p.get("updated")})
@@ -330,8 +333,8 @@ def tool_add_note(args):
     text = (args.get("text") or "").strip()
     if not text:
         raise ToolError("缺少参数 text（笔记正文，支持 Markdown）")
-    if item.get("type") != "paper":
-        raise ToolError("只能给论文条目添加笔记")
+    if item.get("type") not in ("paper", "web", "link"):
+        raise ToolError("只能给论文或网页条目添加笔记")
     note = {"text": text, "source": "manual"}
     if args.get("page") not in (None, ""):
         note["page"] = int(args["page"])
@@ -399,7 +402,7 @@ def tool_list_vocab(args):
     for p in projects:
         pid = p.get("id")
         for it in p.get("items") or []:
-            if it.get("type") != "paper":
+            if it.get("type") not in ("paper", "web", "link") or not it.get("paper_key"):
                 continue
             _, jpath, _ = paper_paths(pid, it)
             state = read_json(jpath) or {}

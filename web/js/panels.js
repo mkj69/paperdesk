@@ -5,6 +5,7 @@ import { setMarkdown } from './markdown.js';
 import { createEditor } from './editor.js';
 import { speakButton, splitSentences } from './tts.js';
 import { githubFileUrl, refreshSync } from './sync.js';
+import { kindMeta, resLabel } from './resources.js';
 
 const TABS = [
   ['notes', '笔记'],
@@ -72,10 +73,29 @@ export function createPanels(ctx, root) {
   notesTools.append(
     STATIC ? null : h('button', { 'data-action': 'new-note', class: 'btn btn-sm', onclick: () => newNote({ page: ctx.currentPage() }) }, icon('plus', 14), '新笔记'),
     h('span', { class: 'spacer' }),
-    h('span', { class: 'faint', style: { fontSize: '12px' } }, STATIC ? '点击笔记或标注跳到原文位置' : '选中 PDF 文字可高亮、划线、记笔记'));
+    h('span', { class: 'faint', style: { fontSize: '12px' } }, STATIC ? '点击笔记或标注跳到原文位置' : '选中文字可高亮、划线、记笔记'));
 
   function mdPath() {
     return `projects/${ctx.pid}/papers/${paper.paper_key}.md`;
+  }
+
+  // ---------- 多资源：徽标与跳转 ----------
+  const multi = () => (ctx.resources || []).length > 1;
+  const ridOf = (x) => (x && x.resource_id) || 'main';
+  function resBadge(rid, onClick, force = false) {
+    const r = ctx.resourceById ? ctx.resourceById(rid) : null;
+    if (!r) return null;
+    if (!multi() && rid === 'main' && !(force && r.kind !== 'paper')) return null;
+    const km = kindMeta(r.kind);
+    return h('button', { class: `rbadge ${rid === ctx.resource ? 'cur' : ''}`, title: `${resLabel(r, { long: true })}\n点击切换到这个资源`, onclick: onClick || (() => ctx.gotoResource(rid)) },
+      h('span', {}, km.icon), h('span', {}, r.main && r.kind === 'paper' ? '论文' : km.label));
+  }
+  function resIndex(rid) {
+    const i = (ctx.resources || []).findIndex((r) => r.id === rid);
+    return i < 0 ? 999 : i;
+  }
+  function anchorStart(x) {
+    return (x && x.anchor && Number.isInteger(x.anchor.start)) ? x.anchor.start : 0;
   }
 
   function renderNotesFoot() {
@@ -87,23 +107,23 @@ export function createPanels(ctx, root) {
   }
   document.addEventListener('pd:sync', renderNotesFoot);
 
-  function newNote({ quote, page, rects, annotation_id } = {}) {
+  function newNote({ quote, page, rects, annotation_id, anchor } = {}) {
     switchTab('notes');
     notesEditorSlot.replaceChildren();
     const ed = createEditor({
       quote: quote ? truncate(quote, 300) : null,
-      placeholder: quote ? '对这段的想法…（**加粗**、<ins>下划线</ins>、$公式$）' : '写一条笔记…（会记在当前页）',
+      placeholder: quote ? '对这段的想法…（**加粗**、<ins>下划线</ins>、$公式$）' : (ctx.isArticleView && ctx.isArticleView() ? '写一条笔记…（会记在当前资源）' : '写一条笔记…（会记在当前页）'),
       saveLabel: '保存笔记',
       onCancel: () => notesEditorSlot.replaceChildren(),
       onSave: async (text) => {
         try {
           let aid = annotation_id;
-          if (!aid && rects && rects.length) {
-            const a = await ctx.createAnnotation({ kind: 'highlight', color: ctx.lastColor || 'yellow', page, quote, rects });
+          if (!aid && ((rects && rects.length) || anchor)) {
+            const a = await ctx.createAnnotation({ kind: 'highlight', color: ctx.lastColor || 'yellow', page, quote, rects, anchor });
             aid = a.id;
             ctx.pdf.clearSelection();
           }
-          await ctx.addNote({ text, page: page || ctx.currentPage(), quote: quote || null, annotation_id: aid || null });
+          await ctx.addNote({ text, page: page || ctx.currentPage(), quote: quote || null, annotation_id: aid || null, anchor: anchor || null });
           notesEditorSlot.replaceChildren();
           toast('笔记已保存', 'ok', 1200);
         } catch (e) {
@@ -116,12 +136,18 @@ export function createPanels(ctx, root) {
     ed.focus();
   }
 
-  function goToAnchor({ annotation_id, page, quote }) {
+  async function goToAnchor({ annotation_id, page, quote, resource_id, anchor }) {
     const a = annotation_id && ctx.annotationById(annotation_id);
     if (a) return ctx.pdf.goToAnnotation(a);
-    if (quote && page) {
-      const same = paper.annotations.find((x) => x.page === page && x.quote === quote);
+    const rid = resource_id || 'main';
+    if (ctx.gotoResource && rid !== ctx.resource && ctx.resourceById(rid)) await ctx.gotoResource(rid);
+    if (quote) {
+      const same = paper.annotations.find((x) => ridOf(x) === rid && x.quote === quote && (!page || x.page === page));
       if (same) return ctx.pdf.goToAnnotation(same);
+    }
+    if (ctx.isArticleView && ctx.isArticleView()) {
+      if (anchor || quote) ctx.pdf.flashAnchor(anchor || { exact: quote });
+      return;
     }
     if (page) ctx.pdf.scrollToPage(page);
   }
@@ -161,6 +187,7 @@ export function createPanels(ctx, root) {
       setMarkdown(body, n.text);
       card.replaceChildren(
         h('div', { class: 'ncard-head' },
+          resBadge(ridOf(n), () => goToAnchor(n), !n.page),
           n.page ? h('button', { class: 'pbadge', title: '跳到原文位置', onclick: () => goToAnchor(n) }, `p.${n.page}`) : null,
           SRC_LABEL[n.source] ? h('span', { class: 'srcbadge' }, SRC_LABEL[n.source]) : null,
           h('span', {}, fmtTime(n.updated || n.created)),
@@ -179,11 +206,11 @@ export function createPanels(ctx, root) {
   function renderNotes() {
     renderNotesFoot();
     notesList.replaceChildren();
-    const notes = paper.notes.slice().sort((x, y) => (x.page || 1e9) - (y.page || 1e9) || (x.created || '').localeCompare(y.created || ''));
+    const notes = paper.notes.slice().sort((x, y) => resIndex(ridOf(x)) - resIndex(ridOf(y)) || (x.page || 1e9) - (y.page || 1e9) || anchorStart(x) - anchorStart(y) || (x.created || '').localeCompare(y.created || ''));
     const annos = paper.annotations.filter((a) => a.kind !== 'vocab')
-      .sort((x, y) => x.page - y.page || ((x.rects && x.rects[0] && x.rects[0][1]) || 0) - ((y.rects && y.rects[0] && y.rects[0][1]) || 0));
+      .sort((x, y) => resIndex(ridOf(x)) - resIndex(ridOf(y)) || (x.page || 0) - (y.page || 0) || anchorStart(x) - anchorStart(y) || ((x.rects && x.rects[0] && x.rects[0][1]) || 0) - ((y.rects && y.rects[0] && y.rects[0][1]) || 0));
     if (!notes.length && !annos.length) {
-      notesList.append(h('div', { class: 'empty', style: { marginTop: '8px' } }, STATIC ? '这篇论文还没有笔记。' : '还没有笔记。选中 PDF 里的文字 → 「记一笔」或高亮；也可以点「新笔记」直接写。'));
+      notesList.append(h('div', { class: 'empty', style: { marginTop: '8px' } }, STATIC ? '这篇论文还没有笔记。' : '还没有笔记。选中 PDF / 网页里的文字 → 「记一笔」或高亮；也可以点「新笔记」直接写。'));
       return;
     }
     if (notes.length) {
@@ -193,10 +220,12 @@ export function createPanels(ctx, root) {
     if (annos.length) {
       notesList.append(h('div', { class: 'sub-title' }, '标注', h('span', { class: 'faint' }, annos.length)));
       for (const a of annos) {
-        notesList.append(h('div', { class: 'alist-item', title: '点击跳到原文', onclick: () => ctx.pdf.goToAnnotation(a) },
+        const r = ctx.resourceById ? ctx.resourceById(ridOf(a)) : null;
+        const loc = a.page ? `p.${a.page}` : (r && multi() ? `${kindMeta(r.kind).icon}` : '');
+        notesList.append(h('div', { class: 'alist-item', dataset: { res: ridOf(a) }, title: r && multi() ? `点击跳到原文（${resLabel(r, { long: true })}）` : '点击跳到原文', onclick: () => ctx.pdf.goToAnnotation(a) },
           h('span', { class: `sw c-${a.color} k-${a.kind}` }),
           h('span', { class: 'q' }, a.quote, a.comment ? h('span', { class: 'faint' }, ` — ${truncate(plainText(a.comment), 80)}`) : null),
-          h('span', { class: 'pg' }, `p.${a.page}`)));
+          h('span', { class: 'pg' }, multi() && a.page && r ? `${kindMeta(r.kind).icon} ${loc}` : loc)));
       }
     }
   }
@@ -276,7 +305,7 @@ export function createPanels(ctx, root) {
     autosize();
     const quote = qaQuote;
     setQuote(null);
-    await ask({ question: q, quote: quote && quote.quote, page: (quote && quote.page) || ctx.currentPage() });
+    await ask({ question: q, quote: quote && quote.quote, page: (quote && quote.page) || (ctx.storePage ? ctx.storePage(ctx.currentPage()) : ctx.currentPage()) });
   }
 
   function qaEntry(qa, { streaming = false } = {}) {
@@ -324,7 +353,7 @@ export function createPanels(ctx, root) {
     updateQaMeta();
     qaList.replaceChildren();
     if (!paper.qa.length) {
-      qaList.append(h('div', { class: 'empty' }, STATIC ? '这篇论文还没有问答记录。' : '向 AI 提问：它会读这篇论文的全文和你的笔记来回答。也可以在 PDF 里选中一段 → 「问 Agent」或「解释」。'));
+      qaList.append(h('div', { class: 'empty' }, STATIC ? '这篇论文还没有问答记录。' : '向 AI 提问：它会读这篇论文的全文（以及关联的博客 / README）和你的笔记来回答。也可以选中一段 → 「问 Agent」或「解释」。'));
     }
     for (const qa of paper.qa) qaList.append(qaEntry(qa).el);
     requestAnimationFrame(() => { qaBody.scrollTop = qaBody.scrollHeight; });
@@ -360,6 +389,7 @@ export function createPanels(ctx, root) {
     };
     try {
       const body = { question, quote: quote || null, page: page || null, engine: ctx.engine, mode };
+      if (ctx.resource) body.resource_id = ctx.resource;
       if (style) body.style = style;
       await sse(`${base}/ask`, body, (ev) => {
         if (ev.type === 'delta') {
@@ -423,14 +453,15 @@ export function createPanels(ctx, root) {
       h('div', { class: 'tr-src' }, t.source),
       h('div', { class: 'tr-dst' }, t.translation || h('span', { class: 'faint' }, '翻译中…')),
       t.translation ? h('div', { class: 'tr-foot' },
-        t.page ? h('button', { class: 'pbadge', onclick: () => goToAnchor({ page: t.page, quote: t.source }) }, `p.${t.page}`) : null,
+        resBadge(ridOf(t), () => goToAnchor({ page: t.page, quote: t.source, resource_id: ridOf(t) }), !t.page),
+        t.page ? h('button', { class: 'pbadge', onclick: () => goToAnchor({ page: t.page, quote: t.source, resource_id: ridOf(t) }) }, `p.${t.page}`) : null,
         h('span', { style: { marginLeft: '4px' } }, `${ENGINE_LABEL[t.engine] || t.engine || ''} · ${fmtTime(t.at)}`),
         h('span', { class: 'spacer' }),
         speakButton(() => t.source, null, '朗读原文'),
         speakButton(() => t.translation, 'zh', '朗读译文'),
         STATIC ? null : h('button', { class: 'lnk', onclick: async () => {
           try {
-            await ctx.addNote({ text: t.translation, quote: t.source, page: t.page || null, source: 'translation' });
+            await ctx.addNote({ text: t.translation, quote: t.source, page: t.page || null, source: 'translation', resource_id: ridOf(t) });
             toast('已收进笔记', 'ok', 1400);
           } catch (e) { toastError(e); }
         } }, '收进笔记'),
@@ -440,7 +471,7 @@ export function createPanels(ctx, root) {
   function renderTranslate() {
     trList.replaceChildren();
     if (!paper.translations.length && !trPageSlot.firstChild) {
-      trList.append(h('div', { class: 'empty' }, STATIC ? '没有翻译记录。' : '在 PDF 中选中文字 → 「翻译」，或点「翻译当前页」做段落对照。'));
+      trList.append(h('div', { class: 'empty' }, STATIC ? '没有翻译记录。' : '选中文字 → 「翻译」，或点「翻译当前页」做段落对照（网页 / README 从当前位置起翻译若干段）。'));
       return;
     }
     if (paper.translations.length) trList.append(h('div', { class: 'sub-title' }, '划词翻译', h('span', { class: 'faint' }, paper.translations.length)));
@@ -455,8 +486,9 @@ export function createPanels(ctx, root) {
     trList.prepend(pending);
     trBody.scrollTop = 0;
     try {
-      const r = await post('/translate', { text, engine: ctx.tengine, target: ctx.settings.target_lang || 'zh-CN', pid: ctx.pid, iid: ctx.iid, page: page || null });
-      const t = { source: text, translation: r.translation, engine: r.engine || ctx.tengine, page: page || null, at: new Date().toISOString(), ...(r.item || {}) };
+      const pg = ctx.storePage ? ctx.storePage(page) : (page || null);
+      const r = await post('/translate', { text, engine: ctx.tengine, target: ctx.settings.target_lang || 'zh-CN', pid: ctx.pid, iid: ctx.iid, page: pg, resource_id: ctx.resource || 'main' });
+      const t = { source: text, translation: r.translation, engine: r.engine || ctx.tengine, page: pg, resource_id: ctx.resource || 'main', at: new Date().toISOString(), ...(r.item || {}) };
       paper.translations.push(t);
       pending.replaceWith(trItem(t));
       updateCounts();
@@ -474,9 +506,12 @@ export function createPanels(ctx, root) {
 
   async function translatePage(n) {
     switchTab('translate');
-    const key = `${n}|${ctx.tengine}`;
+    const art = ctx.isArticleView && ctx.isArticleView();
+    const key = art ? `${ctx.resource}|${Date.now()}|${ctx.tengine}` : `${ctx.resource || 'main'}|${n}|${ctx.tengine}`;
     const box = h('div', { class: 'tr-page' });
-    const head = h('div', { class: 'tr-page-head' }, icon('file', 13), `第 ${n} 页 · ${ENGINE_LABEL[ctx.tengine] || ctx.tengine}`, h('span', { class: 'spacer' }),
+    const r0 = ctx.resourceById ? ctx.resourceById(ctx.resource) : null;
+    const where = art ? `${r0 ? resLabel(r0) : '网页'} · 当前位置起` : `第 ${n} 页`;
+    const head = h('div', { class: 'tr-page-head' }, icon('file', 13), `${where} · ${ENGINE_LABEL[ctx.tengine] || ctx.tengine}`, h('span', { class: 'spacer' }),
       h('button', { class: 'icon-btn', title: '关闭', onclick: () => { box.remove(); if (!trPageSlot.firstChild) renderTranslate(); } }, icon('x', 13)));
     box.append(head);
     trPageSlot.prepend(box);
@@ -490,7 +525,7 @@ export function createPanels(ctx, root) {
       pageTrCache.set(key, paras);
     }
     if (!paras.length) {
-      box.append(h('div', { class: 'faint' }, '这一页没有可提取的文字（可能是扫描版或图片）。'));
+      box.append(h('div', { class: 'faint' }, art ? '当前位置没有可翻译的段落。' : '这一页没有可提取的文字（可能是扫描版或图片）。'));
       return;
     }
     pageBtn.disabled = true;
@@ -511,7 +546,7 @@ export function createPanels(ctx, root) {
         dst.replaceChildren(p.translation);
         row.append(h('div', { class: 'tr-foot' }, h('span', { class: 'spacer' }),
           speakButton(() => p.translation, 'zh', '朗读译文'),
-          h('button', { class: 'lnk', onclick: () => ctx.addNote({ text: p.translation, quote: p.source, page: n, source: 'translation' }).then(() => toast('已收进笔记', 'ok', 1400), toastError) }, '收进笔记')));
+          h('button', { class: 'lnk', onclick: () => ctx.addNote({ text: p.translation, quote: p.source, page: art ? null : n, source: 'translation' }).then(() => toast('已收进笔记', 'ok', 1400), toastError) }, '收进笔记')));
       }
     } finally {
       pageBtn.disabled = false;
@@ -534,11 +569,12 @@ export function createPanels(ctx, root) {
     let list = paper.vocab.slice().sort((a, b) => (b.created || '').localeCompare(a.created || ''));
     if (vOnlyNew.checked) list = list.filter((v) => !v.mastered);
     if (!list.length) {
-      vList.append(h('div', { class: 'empty', style: { marginTop: '8px' } }, paper.vocab.length ? '没有未掌握的生词了 🎉' : STATIC ? '这篇论文没有生词。' : '双击 PDF 里的单词（或选中 ≤6 个词的短语）→ 「生词」，自动查释义并记下原句。'));
+      vList.append(h('div', { class: 'empty', style: { marginTop: '8px' } }, paper.vocab.length ? '没有未掌握的生词了 🎉' : STATIC ? '这篇论文没有生词。' : '双击文中的单词（或选中 ≤6 个词的短语）→ 「生词」，自动查释义并记下原句。'));
       return;
     }
     for (const v of list) vList.append(vocabCard(v, {
-      onJump: () => (v.annotation_id && ctx.annotationById(v.annotation_id) ? ctx.pdf.goToAnnotation(ctx.annotationById(v.annotation_id)) : v.page && ctx.pdf.scrollToPage(v.page)),
+      onJump: () => goToAnchor({ annotation_id: v.annotation_id, page: v.page, quote: v.word, resource_id: ridOf(v) }),
+      source: resBadge(ridOf(v), () => goToAnchor({ annotation_id: v.annotation_id, page: v.page, quote: v.word, resource_id: ridOf(v) }), !v.page),
       readonly: STATIC,
       onToggle: async (m) => {
         try {
@@ -609,11 +645,22 @@ export function createPanels(ctx, root) {
     }
     let ann = null;
     try {
-      ann = await ctx.createAnnotation({ kind: 'vocab', color: 'purple', page: info.page, quote: word, rects: info.rects });
+      let anchor = info.anchor || null;
+      if (anchor && anchor.exact !== word) {
+        // 生词只锚定单词本身（去掉选区两端的标点/空格）
+        const k = anchor.exact.indexOf(word);
+        if (k >= 0) {
+          const full = (anchor.prefix || '') + anchor.exact + (anchor.suffix || '');
+          const off = (anchor.prefix || '').length + k;
+          anchor = { type: 'text', exact: word, prefix: full.slice(Math.max(0, off - 32), off), suffix: full.slice(off + word.length, off + word.length + 32),
+            start: Number.isInteger(anchor.start) ? anchor.start + k : undefined, end: Number.isInteger(anchor.start) ? anchor.start + k + word.length : undefined };
+        }
+      }
+      ann = await ctx.createAnnotation({ kind: 'vocab', color: 'purple', page: info.page, quote: word, rects: info.rects, anchor });
       ctx.pdf.clearSelection();
       const context = await findContext(info.page, word);
       toast(`正在查「${word}」…`, 'info', 1200);
-      const r = await post(`${base}/vocab`, { word, context, page: info.page, annotation_id: ann.id });
+      const r = await post(`${base}/vocab`, { word, context, page: ctx.storePage ? ctx.storePage(info.page) : info.page, annotation_id: ann.id, resource_id: ctx.resource || 'main' });
       const v = r.entry || r;
       upsertVocab(v);
       switchTab('vocab');
@@ -630,7 +677,8 @@ export function createPanels(ctx, root) {
 
   async function addVocabWord(word, { context, page } = {}) {
     try {
-      const r = await post(`${base}/vocab`, { word, context: context || word, page: page || ctx.currentPage(), annotation_id: null });
+      const pg = ctx.storePage ? ctx.storePage(page || ctx.currentPage()) : (page || ctx.currentPage());
+      const r = await post(`${base}/vocab`, { word, context: context || word, page: pg, annotation_id: null, resource_id: ctx.resource || 'main' });
       const v = r.entry || r;
       upsertVocab(v);
       refresh('vocab');
@@ -754,9 +802,11 @@ export function vocabCard(v, { onJump, onToggle, onDelete, source, readonly = fa
   const ctxEl = h('div', { class: 'v-ctx' });
   if (v.context) {
     const word = (v.word || '').trim();
-    const re = word ? new RegExp(`(${word.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')})`, 'ig') : null;
+    // 只加粗完整的词（skim 不会把 Skimmer 的前半截加粗）
+    const esc = word.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const re = word ? new RegExp(`(?<![\\p{L}\\p{N}])(${esc})(?![\\p{L}\\p{N}])`, 'iu') : null;
     const parts = re ? v.context.split(re) : [v.context];
-    for (const p of parts) ctxEl.append(re && re.test(p) && p.toLowerCase() === word.toLowerCase() ? h('b', {}, p) : p);
+    for (const p of parts) ctxEl.append(word && p.toLowerCase() === word.toLowerCase() ? h('b', {}, p) : p);
   }
   const chk = h('input', { type: 'checkbox' });
   chk.checked = !!v.mastered;

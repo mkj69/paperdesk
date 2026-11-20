@@ -312,3 +312,51 @@ app_url 取 settings.app_url（默认 `http://localhost:8765`）。
 - PDF：先尝试 pdf.js 直接加载 `pdf_url`（若源站允许跨域就能完整显示高亮/下划线等标注）；失败则降级为 `<iframe src="<pdf_url>#page=N">` 用浏览器自带 PDF 查看器，
   右侧笔记/标注/问答/生词/总结照常渲染，点击笔记切换 iframe 到对应页（`#page=N`），并显示提示「此 PDF 源站不允许跨域，标注无法叠加显示，已按页码定位」。
   再失败（iframe 也被拒）则只显示右侧内容 + 「在 arXiv 打开」按钮。
+
+## 13. 网页文章（博客）阅读 + 一篇工作的多资源（新增需求）
+用户：除了 PDF，blog 这类网页也要能嵌进来读（同样能翻译、问 AI、标注、记笔记、生词、朗读）；一篇工作常常同时有论文、代码、主页、博客，要能记录并存在一起。
+
+### 13.1 网页文章
+- resolve：非 PDF 的 http(s) 链接 → `type:"web"`（取代原来的 "link"；旧数据里的 "link" 前后端一律按 "web" 处理），返回 `title, site_name, description, kind`（kind 见 13.2）。
+  web 条目的 paper_key = `web-<sha1(url)[:10]>`；`GET /api/papers/<pid>/<iid>` 对 web/link 条目同样可用（状态结构相同，meta 里多 `site_name`）。
+- `GET /api/web?url=<urlencoded>`（不落盘、不缓存；上限 8MB；超时 30s；跟随重定向；按 header / `<meta charset>` 解码）→
+  `{"url":最终地址,"title","byline","site_name","published","lang","html":清洗后的正文 HTML,"text":纯文本（段落间空行）,"word_count","mode":"article|readme"}`。
+  正文抽取（fetcher.py，纯标准库 html.parser，实现一个简化版 Readability）：
+  - 丢弃 script/style/noscript/iframe/form/nav/header/footer/aside/svg/button 以及 class/id 匹配
+    `comment|sidebar|footer|nav|menu|share|social|related|advert|promo|cookie|subscribe|newsletter|breadcrumb` 的元素；
+  - 候选容器优先 `<article>`、`<main>`、`[role=main]`、常见博客正文类（post-content、entry-content、article-body、markdown-body、post、content）；否则按「段落文本长度 − 链接密度惩罚」给块级容器打分取最高；
+  - 输出白名单标签：h1–h6 p ul ol li blockquote pre code img figure figcaption table thead tbody tr th td a em strong b i u sup sub br hr；
+    a/img 的相对地址转绝对地址；img 保留 src/alt（懒加载的 data-src / srcset 首项也要处理）；去掉所有 on* 属性与 style；
+  - 公式：`<script type="math/tex">x</script>` → `$x$`（`mode=display` → `$$x$$`）；KaTeX 渲染结果取其中 `<annotation encoding="application/x-tex">` → `$…$`；MathJax 的 `\(...\)` 原样保留；
+  - 抽取结果太短（< 200 字符）时 `mode:"article"` 仍返回，同时 `"weak":true`，前端提示可「在新标签页打开原网页」。
+- GitHub 仓库链接（`github.com/<o>/<r>` 及其子路径）→ `mode:"readme"`：经 `https://api.github.com/repos/<o>/<r>`（描述、stars、language、homepage）与
+  `https://api.github.com/repos/<o>/<r>/readme`（Accept: application/vnd.github.raw）获取，返回 `{"mode":"readme","markdown","title":"o/r","description","stars","language","homepage","raw_base":"https://raw.githubusercontent.com/<o>/<r>/HEAD/","html_base":"https://github.com/<o>/<r>/blob/HEAD/"}`（失败则 error 中文说明）。
+- 网页的「全文缓存」与标注：
+  - `PUT /api/papers/<pid>/<iid>/text` 增加可选 `"resource_id"`（默认 "main"）；缓存按资源分别存；agent 的 `paper.txt` 依次拼接：PDF（`===== [p.N] =====`）→ 每个网页/README 资源（`===== [网页：<标题>] =====` / `===== [代码 README：o/r] =====`）。没缓存的资源不拼。
+  - 标注新增字段：`"resource_id"`（默认 "main"）、`"anchor":{"type":"text","exact","prefix","suffix","start","end"}`（start/end 为该资源规范化纯文本中的字符偏移；prefix/suffix 各取 32 字符）；网页标注 `page:null, rects:[]`。笔记/问答/翻译/生词同样可带 `resource_id` 与 `anchor`。
+
+### 13.2 一篇工作的多资源
+- item 新增 `"resources":[{"id":"r_xxxx","kind","url","title","pdf_url"?,"auto":bool,"added"}]`。item 自己的主链接视为 id 为 `"main"` 的资源（不写进数组）。
+- kind 取值与识别（fetcher.classify(url)）：arXiv/OpenReview/.pdf/Content-Type pdf → `paper`；github.com / gitlab.com / bitbucket.org / codeberg.org → `code`；
+  youtube.com / youtu.be / bilibili.com / vimeo.com → `video`；huggingface.co/datasets/ → `dataset`；huggingface.co/spaces/ → `demo`；huggingface.co/<o>/<m> → `model`；
+  speakerdeck / slideshare / docs.google.com/presentation / .pptx|.key → `slides`；medium.com / substack.com / distill.pub / 路径含 /blog/ /posts/ /p/ 或域名含 blog → `blog`；
+  其余：路径为空或只有一级 → `homepage`，否则 `blog`。
+- API：`POST /api/projects/<pid>/items/<iid>/resources` `{"url","kind"?,"title"?}` → resource（resolve 取标题与 kind，网络失败降级）；
+  `PATCH .../resources/<rid>` `{"kind"?,"title"?,"url"?}`；`DELETE .../resources/<rid>`（同时删除 resource_id 相同的标注；笔记保留但去掉锚点）。
+- 添加条目时 input 含多个 URL（换行/空格分隔）→ 只建一个条目：主链接取第一个 paper 类链接（没有就取第一个），其余作为 resources。
+- 自动发现（auto:true）：arXiv 论文的 abstract 与 comment 字段里出现的 github.com/... 链接 → code；`project page|website|homepage` 附近的链接或 *.github.io → homepage；
+  GitHub 仓库 README 里出现的 arxiv.org/abs|pdf/<id> → paper（标题后台补）。自动资源去重（同 URL 不重复）。
+- 论文 .md 标题下加一行：`**相关资源**：📄 [论文](…) · 💻 [代码](…) · 🏠 [主页](…) · 📝 [博客](…) · 🎬 [视频](…) · 🤗 [模型/数据](…) · 🖼️ [幻灯片](…)`；
+  项目 README 的条目行带这些图标链接；笔记/标注按资源分组时注明来源（📝 博客：标题）。
+- 前端：
+  - 项目页条目卡片显示资源小标签（图标 + 域名，点开新标签页）与「+ 关联资源」（粘贴 URL，自动识别类型，可改类型）；web 条目卡片显示站点名与摘要，「阅读」进入阅读页。
+  - 阅读页左栏顶部「资源条」：`📄 论文 · 📝 博客：xxx · 🏠 主页 · 💻 代码 · 🎬 视频 …` + 「＋」。切换资源：
+    paper → pdf.js；web/blog/homepage → 文章阅读器（`/api/web`，DOMPurify 清洗，排版成舒适的阅读宽度，图片懒加载，KaTeX 渲染 `$…$` / `\(...\)` / `$$…$$`，代码块等宽）；
+    code → README 阅读器（marked 渲染，相对链接与图片按 raw_base/html_base 补全，顶部显示仓库描述/stars/语言）；video → YouTube/Bilibili 嵌入 iframe（无标注，可记笔记）；
+    抽取失败或 weak → 提示 + 「在新标签页打开原网页」+「仍然用 iframe 嵌入（可能被网站拒绝，无法标注）」。路由 `?res=<rid>` 记住当前资源。
+  - 文章 / README 阅读器复用划词工具条（翻译 / 解释 / 问 Agent / 记一笔 / 高亮 5 色 / 下划线 / 删除线 / 波浪线 / 朗读 / 生词）；标注用 Range 包裹 `<mark class="anno anno-<kind> c-<color>">`，
+    恢复时先按 exact+prefix+suffix 在规范化文本中定位，失败再用 start/end 偏移；点击标注弹出同样的菜单。
+  - 右侧笔记/标注/生词卡片显示资源徽标；点击会切换到对应资源并滚动、闪烁锚点。
+  - 文章加载后把纯文本 PUT 到 text 接口（带 resource_id），问 Agent 时它就能读到博客/README。
+  - 朗读 / 听整篇：对文章资源按段落/句子朗读并高亮当前句。
+  - 静态只读版：文章资源在 GitHub Pages 上无法经代理抓取 → 显示「在新标签页打开」+ 该资源的笔记与标注列表（引文）。

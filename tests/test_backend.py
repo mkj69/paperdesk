@@ -15,6 +15,7 @@ import threading
 import time
 import unittest
 import urllib.error
+import urllib.parse
 import urllib.request
 from unittest import mock
 
@@ -128,6 +129,11 @@ def make_pdf(text="Hello PaperDesk"):
     return out
 
 
+def _read_text(path):
+    with open(path, encoding="utf-8") as f:
+        return f.read()
+
+
 class MockEnv:
     """把模拟 claude / codex 写进临时目录，并设置 PAPERDESK_CLAUDE / PAPERDESK_CODEX。"""
 
@@ -192,7 +198,9 @@ class TestFetcher(unittest.TestCase):
         r = fetcher.resolve("https://example.com/files/paper.pdf")
         self.assertEqual((r["type"], r["title"]), ("paper", "paper.pdf"))
         r = fetcher.resolve("https://example.com/blog")
-        self.assertEqual((r["type"], r["title"]), ("link", "https://example.com/blog"))
+        # SPEC §13：非 PDF 网页 → type "web"，带 kind / paper_key
+        self.assertEqual((r["type"], r["title"], r["kind"]), ("web", "https://example.com/blog", "blog"))
+        self.assertTrue(r["paper_key"].startswith("web-"))
         r = fetcher.resolve("https://openreview.net/forum?id=abc123")
         self.assertEqual(r["pdf_url"], "https://openreview.net/pdf?id=abc123")
         with self.assertRaises(ValueError):
@@ -1061,7 +1069,7 @@ class TestAPI(unittest.TestCase):
         note = self.req("POST", "/api/projects/%s/items" % pid, {"input": "**一个想法**", "type": "note"})
         self.assertEqual(note["type"], "note")
         link = self.req("POST", "/api/projects/%s/items" % pid, {"input": "https://example.invalid/blog"})
-        self.assertEqual(link["type"], "link")
+        self.assertEqual(link["type"], "web")
         paper = self.req("POST", "/api/projects/%s/items" % pid, {"input": "1706.03762"})
         self.assertEqual((paper["type"], paper["paper_key"]), ("paper", "arxiv-1706.03762"))
         dup = self.req("POST", "/api/projects/%s/items" % pid, {"input": "https://arxiv.org/abs/1706.03762v7"})
@@ -1217,6 +1225,354 @@ class TestAPI(unittest.TestCase):
         note = self.req("POST", "/api/projects/%s/items" % p["id"], {"type": "note", "note": "x"})
         self.req("GET", "/api/papers/%s/%s" % (p["id"], note["id"]), expect=400)
 
+
+    def test_web_and_resources(self):
+        """SPEC §13：网页条目、/api/web、资源增删改、按资源缓存全文、多 URL 输入。"""
+        with open(os.path.join(self.files, "post.html"), "w", encoding="utf-8") as f:
+            f.write(BLOG_HTML)
+        p = self.req("POST", "/api/projects", {"name": "Web"})
+        pid = p["id"]
+        blog_url = self.fbase + "/post.html"
+        web = self.req("GET", "/api/web?url=" + urllib.parse.quote(blog_url, safe=""))
+        self.assertEqual(web["mode"], "article")
+        self.assertIn("Attention, intuitively", web["title"])
+        self.assertIn('src="%s/images/heads.png"' % self.fbase, web["html"])
+        self.assertNotIn("Subscribe to my newsletter", web["html"])
+        self.assertFalse(web["weak"])
+        self.req("GET", "/api/web?url=" + urllib.parse.quote("ftp://x/y", safe=""), expect=502)
+        self.req("GET", "/api/web", expect=400)
+
+        # 网页条目：type web，有论文状态，可以缓存全文、标注（锚点）
+        it = self.req("POST", "/api/projects/%s/items" % pid, {"input": blog_url})
+        self.assertEqual(it["type"], "web")
+        self.assertTrue(it["paper_key"].startswith("web-"))
+        self.assertEqual(it["title"], "Attention, intuitively")
+        iid = it["id"]
+        st = self.req("GET", "/api/papers/%s/%s" % (pid, iid))
+        self.assertEqual(st["meta"]["type"], "web")
+        self.assertFalse(st["text_cached"])
+        r = self.req("PUT", "/api/papers/%s/%s/text" % (pid, iid), {"text": web["text"]})
+        self.assertGreater(r["chars"], 200)
+        ann = self.req("POST", "/api/papers/%s/%s/annotations" % (pid, iid), {
+            "kind": "highlight", "color": "green", "quote": "softmax over scores",
+            "anchor": {"exact": "softmax over scores", "prefix": "a ", "suffix": " gives", "start": 120, "end": 139}})
+        self.assertIsNone(ann["page"])
+        self.assertEqual((ann["resource_id"], ann["anchor"]["start"]), ("main", 120))
+
+        # 关联资源：代码（离线 → 仍然保存）、重复链接返回 existing
+        with mock.patch.object(fetcher, "fetch_github_readme", side_effect=fetcher.FetchError("offline")):
+            code = self.req("POST", "/api/projects/%s/items/%s/resources" % (pid, iid),
+                            {"url": "https://github.com/foo/attn"})
+        self.assertEqual((code["kind"], code["existing"]), ("code", False))
+        again = self.req("POST", "/api/projects/%s/items/%s/resources" % (pid, iid), {"url": "https://github.com/foo/attn/"})
+        self.assertTrue(again["existing"])
+        same_main = self.req("POST", "/api/projects/%s/items/%s/resources" % (pid, iid), {"url": blog_url})
+        self.assertEqual(same_main["id"], "main")
+        rid = code["id"]
+        upd = self.req("PATCH", "/api/projects/%s/items/%s/resources/%s" % (pid, iid, rid), {"title": "foo/attn"})
+        self.assertEqual(upd["title"], "foo/attn")
+        self.req("PATCH", "/api/projects/%s/items/%s/resources/%s" % (pid, iid, rid), {"kind": "bogus"}, expect=400)
+        self.req("PUT", "/api/papers/%s/%s/text" % (pid, iid), {"resource_id": rid, "pages": [{"page": 1, "text": "# attn\nREADME 正文"}]})
+        self.req("PUT", "/api/papers/%s/%s/text" % (pid, iid), {"resource_id": "r_nope", "text": "x"}, expect=404)
+        st = self.req("GET", "/api/papers/%s/%s" % (pid, iid))
+        self.assertEqual(st["texts_cached"], ["main", rid])
+        self.assertEqual([r["id"] for r in st["meta"]["resources"]], ["main", rid])
+        a2 = self.req("POST", "/api/papers/%s/%s/annotations" % (pid, iid), {
+            "kind": "underline", "quote": "README 正文", "resource_id": rid, "anchor": {"exact": "README 正文"}})
+        n2 = self.req("POST", "/api/papers/%s/%s/notes" % (pid, iid), {
+            "text": "代码里的 **实现**", "quote": "README 正文", "resource_id": rid, "anchor": {"exact": "README 正文"}})
+        self.assertEqual(n2["resource_id"], rid)
+
+        # 问答带资源：提示词里说明出处，agent 的 paper.txt 拼上了 README
+        evs = self.sse("/api/papers/%s/%s/ask" % (pid, iid), {"question": "这段代码做什么？", "quote": "README 正文",
+                                                               "resource_id": rid, "engine": "claude"})
+        self.assertEqual(evs[-1]["type"], "done")
+        self.assertEqual(evs[-1]["qa"]["resource_id"], rid)
+        paper_txt = _read_text(os.path.join(self.d, ".agent", pid, it["paper_key"], "paper.txt"))
+        self.assertIn("===== [网页：Attention, intuitively] =====", paper_txt)
+        self.assertIn("===== [代码 README：foo/attn] =====", paper_txt)
+
+        md = self.req("GET", "/api/papers/%s/%s/markdown" % (pid, iid), raw=True)[0].decode("utf-8")
+        self.assertIn("**相关资源**：", md)
+        self.assertIn("💻 [代码](https://github.com/foo/attn)", md)
+        self.assertIn("### 💻 代码：foo/attn", md)
+        readme = _read_text(os.path.join(self.d, "projects", pid, "README.md"))
+        self.assertIn("## 🌐 网页与链接", readme)
+        self.assertIn("(https://github.com/foo/attn", readme)
+
+        # 删除资源：它的标注被删掉，笔记保留但去掉锚点
+        self.req("DELETE", "/api/projects/%s/items/%s/resources/%s" % (pid, iid, rid))
+        st = self.req("GET", "/api/papers/%s/%s" % (pid, iid))
+        self.assertNotIn(a2["id"], [a["id"] for a in st["annotations"]])
+        self.assertIn(ann["id"], [a["id"] for a in st["annotations"]])
+        n2b = [n for n in st["notes"] if n["id"] == n2["id"]][0]
+        self.assertEqual(n2b["resource_id"], "main")
+        self.assertNotIn("anchor", n2b)
+        self.assertEqual(st["texts_cached"], ["main"])
+        self.req("DELETE", "/api/projects/%s/items/%s/resources/%s" % (pid, iid, rid), expect=404)
+
+        # 一次粘贴多个链接 → 一个条目 + 资源
+        multi = "%s\nhttps://github.com/foo/bar  %s" % (self.fbase + "/sample.pdf", blog_url)
+        with mock.patch.object(fetcher, "fetch_github_readme", side_effect=fetcher.FetchError("offline")):
+            item = self.req("POST", "/api/projects/%s/items" % pid, {"input": multi})
+        self.assertEqual(item["type"], "paper")
+        self.assertEqual([(r["kind"], r["url"]) for r in item["resources"]],
+                         [("code", "https://github.com/foo/bar"), ("homepage", blog_url)])
+        self.assertEqual(item["resources"][1]["title"], "Attention, intuitively")
+
+        # 旧数据里的 link 条目也能打开阅读状态（自动补 paper_key）
+        store.add_item(self.d, pid, {"type": "link", "url": "https://old.example/post", "title": "旧链接"})
+        proj = store.get_project(self.d, pid)
+        old = [x for x in proj["items"] if x.get("url") == "https://old.example/post"][0]
+        st = self.req("GET", "/api/papers/%s/%s" % (pid, old["id"]))
+        self.assertTrue(st["paper_key"].startswith("web-"))
+
+
+
+# =============================================================================================
+BLOG_HTML = """<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<title>Attention, intuitively | Kai's Notes</title>
+<meta property="og:site_name" content="Kai's Notes">
+<meta property="og:title" content="Attention, intuitively">
+<meta name="author" content="Kai">
+<meta property="article:published_time" content="2026-03-01T10:00:00Z">
+<meta name="description" content="A gentle walk through scaled dot-product attention.">
+</head><body>
+<header class="site-header"><a href="/">Kai's Notes</a><nav><a href="/about">About</a><a href="/tags">Tags</a></nav></header>
+<div class="layout">
+ <aside class="sidebar"><h3>Recent posts</h3><ul><li><a href="/p/1">Post one</a></li><li><a href="/p/2">Post two</a></li></ul></aside>
+ <main><article class="post">
+  <h1>Attention, intuitively</h1>
+  <div class="share-buttons"><a href="https://twitter.com/share">Tweet</a> <a href="#">Share on LinkedIn</a></div>
+  <div class="post-content">
+   <p>Attention lets every token look at every other token. A query is compared with all keys, and a softmax over scores gives the weights, which are used to average the values. This is the core of the Transformer.</p>
+   <p>The scaled version divides by <script type="math/tex">\\sqrt{d_k}</script> so that the softmax does not saturate when the dimension grows, which keeps gradients healthy during training.</p>
+   <script type="math/tex; mode=display">\\mathrm{Attn}(Q,K,V)=\\mathrm{softmax}(QK^\\top/\\sqrt{d_k})V</script>
+   <p>KaTeX also works: <span class="katex"><span class="katex-mathml"><math><semantics><mrow><mi>x</mi></mrow><annotation encoding="application/x-tex">x^2</annotation></semantics></math></span><span class="katex-html" aria-hidden="true">x2</span></span> is rendered inline.</p>
+   <figure><img src="data:image/gif;base64,R0lGOD" data-src="images/heads.png" alt="attention heads"><figcaption>Figure 1: heads attend to different things.</figcaption></figure>
+   <img src="/static/plot.png" alt="plot">
+   <pre><code class="language-python">def attn(q, k, v):
+    w = softmax(q @ k.T / d ** 0.5)
+    return w @ v</code></pre>
+   <p>Read the <a href="../papers/attention.html">paper notes</a> for details.</p>
+  </div>
+  <section class="comments"><h3>Leave a comment</h3><p>Great post! Thanks for sharing this with everyone.</p></section>
+ </article></main>
+</div>
+<div class="newsletter-signup"><p>Subscribe to my newsletter for weekly posts about machine learning and more.</p></div>
+<footer><p>© 2026 Kai. All rights reserved.</p></footer>
+<script>console.log("analytics")</script>
+</body></html>
+"""
+
+NO_SEMANTIC_HTML = """<html><head><title>Plain page</title></head><body>
+<div id="top"><a href="/a">Home</a> | <a href="/b">Archive</a> | <a href="/c">Links</a> | <a href="/d">Contact</a></div>
+<div id="wrap">
+ <div id="x1"><p>The first real paragraph of this essay explains, in some detail, why simple baselines matter, and why they are so often skipped.</p>
+ <p>The second paragraph continues the argument, adds a few more sentences, and keeps going for a while so it is clearly the main text.</p>
+ <p>A third paragraph, with commas, clauses, and examples, makes the content block obviously the densest part of the page.</p></div>
+ <div id="x2"><p><a href="/1">Related link one</a> <a href="/2">Related link two</a> <a href="/3">Related link three</a></p></div>
+</div></body></html>"""
+
+
+class TestWebExtract(unittest.TestCase):
+    def test_blog_with_noise(self):
+        r = fetcher.extract_article(BLOG_HTML, "https://kai.example/posts/attention/")
+        self.assertEqual(r["title"], "Attention, intuitively")
+        self.assertEqual(r["site_name"], "Kai's Notes")
+        self.assertEqual(r["byline"], "Kai")
+        self.assertTrue(r["published"].startswith("2026-03-01"))
+        self.assertEqual(r["lang"], "en")
+        h = r["html"]
+        for junk in ("Recent posts", "Tweet", "Leave a comment", "Subscribe to my newsletter", "All rights reserved",
+                     "analytics", "About"):
+            self.assertNotIn(junk, h, junk)
+        self.assertIn("softmax over scores", h)
+        # 懒加载 + 相对图片 → 绝对地址；占位 data: 图不出现
+        self.assertIn('<img src="https://kai.example/posts/attention/images/heads.png" alt="attention heads">', h)
+        self.assertIn('<img src="https://kai.example/static/plot.png" alt="plot">', h)
+        self.assertNotIn("data:image", h)
+        self.assertIn("<figcaption>Figure 1", h)
+        self.assertIn('<a href="https://kai.example/posts/papers/attention.html">paper notes</a>', h)
+        # 公式
+        self.assertIn("$\\sqrt{d_k}$", h)
+        self.assertIn("$$\\mathrm{Attn}(Q,K,V)", h)
+        self.assertIn("$x^2$", h)
+        self.assertNotIn("katex-html", h)
+        # 代码块保留换行与语言
+        self.assertIn('<pre><code class="language-python">def attn(q, k, v):\n    w = softmax', h)
+        # 纯文本：段落之间空行
+        self.assertIn("This is the core of the Transformer.\n\nThe scaled version", r["text"])
+        self.assertGreater(r["word_count"], 60)
+        self.assertFalse(r["weak"])
+        for tag in ("script", "style", "div", "span", "nav", "aside"):
+            self.assertNotIn("<%s" % tag, h)
+
+    def test_gbk_chinese_page(self):
+        page = ("<html><head><meta http-equiv='Content-Type' content='text/html; charset=gb2312'>"
+                "<title>注意力机制详解 - 某某博客</title></head><body>"
+                "<div class='nav'><a href='/'>首页</a><a href='/about'>关于</a></div>"
+                "<div class='entry-content'><p>注意力机制让模型在处理每个词的时候，都能看到句子里所有其他的词，"
+                "并根据相关程度分配不同的权重。这是 Transformer 的核心思想。</p>"
+                "<p>缩放点积注意力把点积除以维度的平方根，避免 softmax 饱和，从而让训练更稳定。"
+                "这一段继续补充更多说明文字，确保正文足够长。</p>"
+                "<p>多头注意力把表示切成多份，在不同子空间里分别计算注意力，最后再拼接起来。</p></div>"
+                "<div class='footer'>版权所有</div></body></html>")
+        data = page.encode("gbk")
+        text = fetcher.decode_html(data, "text/html")
+        self.assertIn("注意力机制让模型", text)
+        r = fetcher.extract_article(text, "https://blog.example.cn/a/1.html")
+        self.assertEqual(r["title"], "注意力机制详解 - 某某博客")
+        self.assertIn("缩放点积注意力", r["text"])
+        self.assertNotIn("首页", r["text"])
+        self.assertNotIn("版权所有", r["text"])
+        self.assertGreater(r["word_count"], 80)
+        # HTTP 头里的编码优先；BOM 最优先
+        self.assertEqual(fetcher.decode_html("中文".encode("gbk"), "text/html; charset=GBK"), "中文")
+        self.assertEqual(fetcher.decode_html(b"\xef\xbb\xbf" + "中文".encode("utf-8"), "text/html; charset=gbk"), "中文")
+
+    def test_scoring_fallback_and_weak(self):
+        r = fetcher.extract_article(NO_SEMANTIC_HTML, "https://plain.example/essay")
+        self.assertIn("simple baselines matter", r["text"])
+        self.assertNotIn("Related link one", r["text"])
+        self.assertNotIn("Archive", r["text"])
+        weak = fetcher.extract_article("<html><body><p>Too short.</p></body></html>", "https://x.example/")
+        self.assertTrue(weak["weak"])
+        self.assertEqual(fetcher.extract_article("", "https://x.example/")["text"], "")
+
+    def test_mathml_and_mathjax3(self):
+        h = ('<html><body><article class="post"><p>' + "word " * 60 + '</p>'
+             '<p>Inline <math alttext="a+b"><mi>a</mi></math> and <mjx-container><svg></svg></mjx-container>.</p>'
+             '<p><span class="MathJax_Preview">x</span><span class="MathJax">rendered</span>'
+             '<script type="math/tex">y_i</script> done.</p></article></body></html>')
+        r = fetcher.extract_article(h, "https://m.example/")
+        self.assertIn("$a+b$", r["html"])
+        self.assertIn("[公式]", r["html"])
+        self.assertIn("$y_i$", r["html"])
+        self.assertNotIn("rendered", r["html"])
+
+
+class TestResourcesDiscovery(unittest.TestCase):
+    def test_classify(self):
+        cases = {
+            "https://arxiv.org/abs/1706.03762": "paper", "https://openreview.net/forum?id=x": "paper",
+            "https://example.org/a/paper.pdf": "paper", "https://huggingface.co/papers/2406.1": "paper",
+            "https://github.com/foo/bar": "code", "https://github.com/foo/bar/tree/main/src": "code",
+            "https://gitlab.com/foo/bar": "code", "https://bitbucket.org/foo/bar": "code",
+            "https://codeberg.org/foo/bar": "code", "https://github.com/foo": "homepage",
+            "https://www.youtube.com/watch?v=1": "video", "https://youtu.be/1": "video",
+            "https://www.bilibili.com/video/BV1": "video", "https://vimeo.com/1": "video",
+            "https://huggingface.co/datasets/a/b": "dataset", "https://huggingface.co/spaces/a/b": "demo",
+            "https://huggingface.co/meta-llama/Llama-3": "model",
+            "https://speakerdeck.com/a/b": "slides", "https://www.slideshare.net/a/b": "slides",
+            "https://docs.google.com/presentation/d/1/edit": "slides", "https://x.org/talk.pptx": "slides",
+            "https://medium.com/@a/post-1": "blog", "https://a.substack.com/p/hello": "blog",
+            "https://distill.pub/2016/augmented-rnns/": "blog", "https://blog.example.com/x/y": "blog",
+            "https://lilianweng.github.io/posts/2023-06-23-agent/": "blog",
+            "https://nerf.github.io/": "homepage", "https://example.com/project": "homepage",
+            "https://example.com/a/b/c": "blog",
+        }
+        for url, kind in cases.items():
+            self.assertEqual(fetcher.classify(url), kind, url)
+        self.assertEqual(fetcher.github_repo_of("https://github.com/foo/bar.git"), ("foo", "bar"))
+        self.assertIsNone(fetcher.github_repo_of("https://github.com/features/copilot"))
+        self.assertEqual(fetcher.split_inputs("1706.03762\nhttps://github.com/a/b, https://a.github.io/"),
+                         ["1706.03762", "https://github.com/a/b", "https://a.github.io/"])
+        self.assertEqual(fetcher.split_inputs("https://a.example/ some words"), ["https://a.example/ some words"])
+
+    def test_arxiv_auto_discovery(self):
+        atom = b"""<?xml version="1.0"?><feed xmlns="http://www.w3.org/2005/Atom" xmlns:arxiv="http://arxiv.org/schemas/atom">
+<entry><title>Looped Transformers</title><author><name>A. Author</name></author>
+<summary>We propose X. Code is available at https://github.com/foo/looped. Models: https://huggingface.co/foo/looped-1b.
+We compare with https://arxiv.org/abs/1706.03762.</summary>
+<published>2024-06-01T00:00:00Z</published>
+<arxiv:comment>NeurIPS 2024. Project page: https://foo.example.org/looped (with demo videos); see also github.com/foo/looped-extra</arxiv:comment>
+</entry></feed>"""
+        with mock.patch.object(fetcher, "_http_get", return_value=(atom, "application/atom+xml")):
+            r = fetcher.resolve("2406.00001")
+        self.assertEqual(r["title"], "Looped Transformers")
+        got = [(x["kind"], x["url"], x["auto"]) for x in r["resources"]]
+        self.assertIn(("code", "https://github.com/foo/looped", True), got)
+        self.assertIn(("model", "https://huggingface.co/foo/looped-1b", True), got)
+        self.assertIn(("homepage", "https://foo.example.org/looped", True), got)
+        self.assertIn(("code", "https://github.com/foo/looped-extra", True), got)
+        self.assertFalse(any("arxiv.org" in u for _, u, _ in got))
+
+    def test_readme_auto_discovery(self):
+        info = {"title": "foo/looped", "description": "Official code", "homepage": "https://foo.github.io/looped/",
+                "markdown": "# Looped\n[![arXiv](badge)](https://arxiv.org/abs/2406.00001v2)\nSee also arxiv.org/abs/1706.03762"}
+        with mock.patch.object(fetcher, "fetch_github_readme", return_value=info):
+            r = fetcher.resolve("https://github.com/foo/looped")
+        self.assertEqual((r["type"], r["kind"], r["title"]), ("web", "code", "foo/looped"))
+        self.assertEqual(r["description"], "Official code")
+        papers = [x for x in r["resources"] if x["kind"] == "paper"]
+        self.assertEqual(len(papers), 1)
+        self.assertEqual((papers[0]["arxiv_id"], papers[0]["pdf_url"]), ("2406.00001", "https://arxiv.org/pdf/2406.00001"))
+        self.assertIn(("homepage", "https://foo.github.io/looped/"), [(x["kind"], x["url"]) for x in r["resources"]])
+
+    def test_store_resources_markdown(self):
+        d = tempfile.mkdtemp(prefix="pd-res-")
+        try:
+            store.ensure_library(d)
+            it = store.add_item(d, "inbox", {
+                "type": "paper", "title": "Looped Transformers", "url": "https://arxiv.org/abs/2406.00001",
+                "pdf_url": "https://arxiv.org/pdf/2406.00001", "arxiv_id": "2406.00001",
+                "resources": [{"kind": "code", "url": "https://github.com/foo/looped", "auto": True},
+                              {"url": "https://arxiv.org/abs/2406.00001"},           # 与主链接相同 → 丢弃
+                              {"url": "https://github.com/foo/looped/"},             # 重复 → 丢弃
+                              {"url": "https://kai.example/posts/looped/", "title": "图解 Looped"}]})
+            self.assertEqual([r["kind"] for r in it["resources"]], ["code", "blog"])
+            blog_rid = it["resources"][1]["id"]
+            store.add_annotation(d, "inbox", it["id"], {"kind": "highlight", "page": 3, "quote": "PDF 里的一句"})
+            store.add_annotation(d, "inbox", it["id"], {"kind": "squiggly", "quote": "博客里的一句", "resource_id": blog_rid,
+                                                        "anchor": {"exact": "博客里的一句", "start": 5, "end": 11}})
+            store.add_note(d, "inbox", it["id"], {"text": "博客的 **解释** 更直观", "quote": "博客里的一句",
+                                                  "resource_id": blog_rid, "anchor": {"exact": "博客里的一句"}})
+            store.add_note(d, "inbox", it["id"], {"text": "PDF 笔记", "page": 3})
+            store.write_cached_text(d, "inbox", it["paper_key"], [{"page": 1, "text": "PDF 第一页"}])
+            store.write_cached_text(d, "inbox", it["paper_key"], [{"page": 1, "text": "博客正文"}], resource_id=blog_rid)
+            txt = store.agent_text_string(d, "inbox", store.find_item(d, "inbox", it["id"]))
+            self.assertIn("===== [p.1] =====\nPDF 第一页", txt)
+            self.assertIn("===== [网页：图解 Looped] =====\n博客正文", txt)
+            md = store.paper_markdown(d, "inbox", it["id"])
+            self.assertIn("**相关资源**：📄 [论文](https://arxiv.org/abs/2406.00001) · 💻 [代码](https://github.com/foo/looped)"
+                          " · 📝 [博客：图解 Looped](https://kai.example/posts/looped/)", md)
+            self.assertIn("### 📄 论文", md)
+            self.assertIn("### 📝 博客：图解 Looped", md)
+            self.assertIn("**📝 博客：图解 Looped**", md)
+            self.assertIn("- 🟨 波浪线：<ins>*“博客里的一句”*</ins>", md)
+            self.assertIn("- **p.3** 🟨 高亮：“PDF 里的一句”", md)
+            self.assertLess(md.index("PDF 笔记"), md.index("博客的 **解释** 更直观"))
+            readme = _read_text(os.path.join(d, "projects", "inbox", "README.md"))
+            self.assertIn("[💻](https://github.com/foo/looped", readme)
+            # 删除博客资源：它的标注没了，笔记留下且不再有锚点，缓存删除
+            store.delete_resource(d, "inbox", it["id"], blog_rid)
+            st = store.get_paper_state(d, "inbox", it["id"])
+            self.assertEqual([a["quote"] for a in st["annotations"]], ["PDF 里的一句"])
+            moved = [n for n in st["notes"] if "博客" in n["text"]][0]
+            self.assertEqual(moved["resource_id"], "main")
+            self.assertNotIn("anchor", moved)
+            self.assertEqual(store.cached_resources(d, "inbox", it["paper_key"]), ["main"])
+            md = store.paper_markdown(d, "inbox", it["id"])
+            self.assertIn("原关联资源「图解 Looped」已移除", md)
+            # 移动条目时资源与缓存跟着走
+            store.create_project(d, "Dst")
+            store.add_resource(d, "inbox", it["id"], {"url": "https://youtu.be/abc", "title": "talk"})
+            vid = [r for r in store.find_item(d, "inbox", it["id"])["resources"] if r["kind"] == "video"][0]
+            store.write_cached_text(d, "inbox", it["paper_key"], [{"page": 1, "text": "字幕"}], resource_id=vid["id"])
+            store.move_item(d, "inbox", it["id"], "dst")
+            self.assertEqual(store.cached_resources(d, "dst", it["paper_key"]), ["main", vid["id"]])
+            self.assertEqual(len(store.find_item(d, "dst", it["id"])["resources"]), 2)
+            with self.assertRaises(ValueError):
+                store.add_resource(d, "dst", it["id"], {"url": ""})
+            note_item = store.add_item(d, "dst", {"type": "note", "note": "随手记"})
+            with self.assertRaises(ValueError):
+                store.add_resource(d, "dst", note_item["id"], {"url": "https://x.example/"})
+            counts = [p for p in store.list_projects(d) if p["id"] == "dst"][0]["counts"]
+            self.assertEqual(counts, {"paper": 1, "web": 0, "link": 0, "note": 1})
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

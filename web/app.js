@@ -58,6 +58,7 @@ async function route() {
         iid: decodeURIComponent(m[2]),
         page: params.get('page') ? +params.get('page') : null,
         anno: params.get('anno'),
+        res: params.get('res'),
       });
     } else if ((m = path.match(/^\/p\/([^/]+)\/?$/))) {
       const { mountProject } = await import('./js/project.js');
@@ -117,7 +118,7 @@ function renderSidebar() {
   const sorted = projects.slice().sort((a, b) => (a.id === 'inbox' ? -1 : b.id === 'inbox' ? 1 : 0));
   for (const p of sorted) {
     const c = p.counts || {};
-    const n = (c.paper || 0) + (c.link || 0) + (c.note || 0);
+    const n = (c.paper || 0) + (c.web || 0) + (c.link || 0) + (c.note || 0);
     list.append(h('a', {
       class: `sb-item ${decodeURIComponent(activePid || '') === p.id ? 'active' : ''}`,
       href: appHref(`/p/${encodeURIComponent(p.id)}`),

@@ -9,6 +9,7 @@
   库与项目
     ensure_library(data_dir) -> None                         # 建目录、收件箱、.gitignore、README
     list_projects(data_dir) -> list[dict]                     # [{id,name,description,created,updated,counts}]
+        counts = {"paper","web","link","note"}；其中 link = 旧 link + web（兼容旧界面），web 只算 web
     get_project(data_dir, pid) -> dict                        # 含 items
     create_project(data_dir, name, description="") -> dict
     update_project(data_dir, pid, name=None, description=None) -> dict
@@ -16,12 +17,19 @@
 
   条目
     add_item(data_dir, pid, item_dict) -> dict                # 返回 item（额外带 "existing": bool，不落盘）
-        item_dict 可含：type("paper"|"link"|"note"), title, url, pdf_url, arxiv_id, authors, year,
-        abstract, paper_key, note, tags, status
+        item_dict 可含：type("paper"|"web"|"link"|"note"), kind, title, url, pdf_url, arxiv_id, authors, year,
+        abstract, paper_key, note, tags, status, site_name, description, resources
+        （"link" 是旧数据的类型，行为与 "web" 相同；web/link/paper 条目都有论文状态）
     find_item(data_dir, pid, iid) -> dict
     update_item(data_dir, pid, iid, patch) -> dict            # title/tags/status/note/url
     delete_item(data_dir, pid, iid) -> None
     move_item(data_dir, pid, iid, to_pid) -> dict
+
+  资源（一篇工作的论文 / 代码 / 主页 / 博客……，SPEC §13.2）
+    add_resource(data_dir, pid, iid, res_dict) -> dict        # {url, kind?, title?, pdf_url?, arxiv_id?, auto?}，带 "existing"
+    update_resource(data_dir, pid, iid, rid, patch) -> dict   # kind/title/url
+    delete_resource(data_dir, pid, iid, rid) -> None          # 同时删掉该资源的标注；笔记保留、去掉锚点
+    item_resources(item) -> list[dict]                        # 含主链接（id="main"）在内的全部资源
 
   论文状态
     get_paper_state(data_dir, pid, iid) -> dict               # 不存在则按 item 初始化并保存
@@ -50,8 +58,10 @@
     refresh_vocabulary(data_dir) -> None                      # 重写根目录 vocabulary.md
 
   全文缓存 / 当前论文 / 渲染
-    write_cached_text(data_dir, pid, paper_key, pages) -> int        # 返回字符数
-    read_cached_text(data_dir, pid, paper_key) -> list[dict] | None  # [{page,text}]
+    write_cached_text(data_dir, pid, paper_key, pages, resource_id="main", title=None, kind=None) -> int
+    read_cached_text(data_dir, pid, paper_key, resource_id="main") -> list[dict] | None  # [{page,text}]
+    cached_resources(data_dir, pid, paper_key) -> list[str]           # 有缓存的资源 id
+    agent_text_string(data_dir, pid, item) -> str | None              # 拼好的 paper.txt 正文（PDF + 网页 + README）
     cached_text_string(data_dir, pid, paper_key, pages=None) -> str | None
     write_current(data_dir, pid, iid) -> dict
     read_current(data_dir) -> dict | None
@@ -198,11 +208,19 @@ def _save_project(data_dir, project, refresh=True):
         refresh_readmes(data_dir, project["id"])
 
 
+STATEFUL_TYPES = ("paper", "web", "link")     # 有论文状态（可阅读、可标注）的条目类型
+RESOURCE_KINDS = ("paper", "code", "homepage", "blog", "video", "slides", "dataset", "model", "demo", "other")
+
+
 def _counts(items):
-    c = {"paper": 0, "link": 0, "note": 0}
+    c = {"paper": 0, "web": 0, "link": 0, "note": 0}
     for it in items:
-        if it.get("type") in c:
-            c[it["type"]] += 1
+        t = it.get("type")
+        if t == "web":
+            c["web"] += 1
+            c["link"] += 1
+        elif t in c:
+            c[t] += 1
     return c
 
 
@@ -312,10 +330,48 @@ def _clean_tags(tags):
     return out
 
 
+def _norm_resource(r, now=None):
+    """清洗一条资源记录；url 为空返回 None。"""
+    if not isinstance(r, dict):
+        return None
+    url = (r.get("url") or "").strip()
+    if not url:
+        return None
+    from .fetcher import classify  # 延迟导入避免循环
+    kind = r.get("kind") if r.get("kind") in RESOURCE_KINDS else classify(url)
+    out = {"id": r.get("id") or _new_id("r_"), "kind": kind, "url": url,
+           "title": (r.get("title") or "").strip()[:300], "auto": bool(r.get("auto")),
+           "added": r.get("added") or now or config.now_iso()}
+    if r.get("pdf_url"):
+        out["pdf_url"] = r["pdf_url"]
+    if r.get("arxiv_id"):
+        out["arxiv_id"] = r["arxiv_id"]
+    return out
+
+
+def _same_url(a, b):
+    def n(u):
+        u = (u or "").strip().lower()
+        u = re.sub(r"^https?://(www\.)?", "", u)
+        return u.rstrip("/")
+    return bool(a) and bool(b) and n(a) == n(b)
+
+
+def item_resources(item):
+    """条目的全部资源：主链接（id="main"）+ resources 数组。"""
+    out = []
+    if item.get("type") in STATEFUL_TYPES and (item.get("url") or item.get("pdf_url")):
+        kind = item.get("kind") or ("paper" if item.get("type") == "paper" else "blog")
+        out.append({"id": "main", "kind": kind, "url": item.get("url") or item.get("pdf_url"),
+                    "pdf_url": item.get("pdf_url"), "title": item.get("title") or "", "auto": False})
+    out.extend(item.get("resources") or [])
+    return out
+
+
 def add_item(data_dir, pid, item_dict):
     d = dict(item_dict or {})
-    typ = d.get("type") or ("note" if d.get("note") else "link")
-    if typ not in ("paper", "link", "note"):
+    typ = d.get("type") or ("note" if d.get("note") else "web")
+    if typ not in ("paper", "web", "link", "note"):
         raise ValueError("未知的条目类型：%s" % typ)
     with _LOCK:
         p = _load_project(data_dir, pid)
@@ -331,11 +387,16 @@ def add_item(data_dir, pid, item_dict):
                     return out
             if not (d.get("pdf_url") or d.get("url")):
                 raise ValueError("论文需要 PDF 链接")
-        elif typ == "link":
+        elif typ in ("web", "link"):
             if not d.get("url"):
                 raise ValueError("链接不能为空")
+            key = d.get("paper_key")
+            if not key:
+                from .fetcher import web_key_for
+                key = web_key_for(d["url"])
             for it in p["items"]:
-                if it.get("type") == "link" and it.get("url") == d.get("url"):
+                if it.get("type") in ("web", "link") and (it.get("url") == d.get("url") or
+                                                          (it.get("paper_key") and it.get("paper_key") == key)):
                     out = dict(it)
                     out["existing"] = True
                     return out
@@ -353,7 +414,8 @@ def add_item(data_dir, pid, item_dict):
             "authors": list(d.get("authors") or []),
             "year": d.get("year"),
             "abstract": d.get("abstract"),
-            "paper_key": key if typ == "paper" else None,
+            "paper_key": key if typ in STATEFUL_TYPES else None,
+            "kind": (d.get("kind") if d.get("kind") in RESOURCE_KINDS else None) or ("paper" if typ == "paper" else None),
             "note": d.get("note") if typ == "note" else None,
             "tags": _clean_tags(d.get("tags")),
             "status": d.get("status") if d.get("status") in ("unread", "reading", "done") else "unread",
@@ -361,15 +423,33 @@ def add_item(data_dir, pid, item_dict):
             "updated": now,
         }
         if typ != "paper":
-            for k in ("pdf_url", "arxiv_id", "paper_key"):
+            for k in ("pdf_url", "arxiv_id"):
                 item[k] = None
+        if typ in ("web", "link"):
+            from .fetcher import classify
+            item["kind"] = item["kind"] or classify(item["url"])
+            item["site_name"] = d.get("site_name") or ""
+            item["description"] = (d.get("description") or "")[:500]
+        if typ == "note":
+            item["paper_key"] = None
+            item["kind"] = None
+        if typ in STATEFUL_TYPES:
+            res = []
+            for r in d.get("resources") or []:
+                nr = _norm_resource(r, now)
+                if not nr or _same_url(nr["url"], item.get("url")) or _same_url(nr["url"], item.get("pdf_url")):
+                    continue
+                if any(_same_url(nr["url"], x["url"]) for x in res):
+                    continue
+                res.append(nr)
+            item["resources"] = res
         p["items"].insert(0, item)
         p["updated"] = now
         _save_project(data_dir, p, refresh=False)
-        if typ == "paper":
+        if typ in STATEFUL_TYPES:
             _init_paper_state(data_dir, p, item)
         refresh_readmes(data_dir, pid)
-    _notify("添加%s「%s」" % ({"paper": "论文", "link": "链接", "note": "笔记"}[typ], item["title"][:60]))
+    _notify("添加%s「%s」" % ({"paper": "论文", "web": "网页", "link": "链接", "note": "笔记"}[typ], item["title"][:60]))
     out = dict(item)
     out["existing"] = False
     return out
@@ -397,7 +477,7 @@ def update_item(data_dir, pid, iid, patch):
         it["updated"] = config.now_iso()
         p["updated"] = it["updated"]
         _save_project(data_dir, p, refresh=False)
-        if it["type"] == "paper":
+        if it["type"] in STATEFUL_TYPES and it.get("paper_key"):
             st = _load_state(data_dir, pid, it["paper_key"])
             if st is not None:
                 st["meta"]["title"] = it["title"]
@@ -415,13 +495,13 @@ def delete_item(data_dir, pid, iid):
         p["items"] = [x for x in p["items"] if x.get("id") != iid]
         p["updated"] = config.now_iso()
         _save_project(data_dir, p, refresh=False)
-        if it.get("type") == "paper" and it.get("paper_key"):
+        if it.get("type") in STATEFUL_TYPES and it.get("paper_key"):
             for src in (_paper_json(data_dir, pid, it["paper_key"]), _paper_md(data_dir, pid, it["paper_key"])):
                 if os.path.exists(src):
                     shutil.move(src, os.path.join(_trash_dir(data_dir),
                                                   "%s-%s-%s" % (_stamp(), pid, os.path.basename(src))))
         refresh_readmes(data_dir, pid)
-        if it.get("type") == "paper":
+        if it.get("type") in STATEFUL_TYPES:
             refresh_vocabulary(data_dir)
     _notify("删除条目「%s」" % it.get("title", "")[:60])
 
@@ -433,17 +513,17 @@ def move_item(data_dir, pid, iid, to_pid):
         src = _load_project(data_dir, pid)
         dst = _load_project(data_dir, to_pid)
         it = _find(src, iid)
-        if it.get("type") == "paper":
+        if it.get("type") in STATEFUL_TYPES and it.get("paper_key"):
             for x in dst["items"]:
-                if x.get("type") == "paper" and x.get("paper_key") == it.get("paper_key"):
-                    raise Conflict("目标项目里已经有这篇论文了")
+                if x.get("type") in STATEFUL_TYPES and x.get("paper_key") == it.get("paper_key"):
+                    raise Conflict("目标项目里已经有这篇论文 / 网页了")
         src["items"] = [x for x in src["items"] if x.get("id") != iid]
         it["updated"] = config.now_iso()
         dst["items"].insert(0, it)
         src["updated"] = dst["updated"] = it["updated"]
         _save_project(data_dir, src, refresh=False)
         _save_project(data_dir, dst, refresh=False)
-        if it.get("type") == "paper" and it.get("paper_key"):
+        if it.get("type") in STATEFUL_TYPES and it.get("paper_key"):
             key = it["paper_key"]
             os.makedirs(os.path.join(_project_dir(data_dir, to_pid), "papers"), exist_ok=True)
             st = _load_state(data_dir, pid, key)
@@ -453,17 +533,126 @@ def move_item(data_dir, pid, iid, to_pid):
             if st is not None:
                 st["pid"] = to_pid
                 _write_state(data_dir, to_pid, st, dst)
-            # 迁移全文缓存
-            old_c = _cache_file(data_dir, pid, key)
-            if os.path.exists(old_c):
-                new_c = _cache_file(data_dir, to_pid, key)
-                os.makedirs(os.path.dirname(new_c), exist_ok=True)
-                shutil.move(old_c, new_c)
+            # 迁移全文缓存（主资源 + 各资源）
+            for rid in ["main"] + [r.get("id") for r in it.get("resources") or []]:
+                old_c = _cache_file(data_dir, pid, key, rid)
+                if os.path.exists(old_c):
+                    new_c = _cache_file(data_dir, to_pid, key, rid)
+                    os.makedirs(os.path.dirname(new_c), exist_ok=True)
+                    shutil.move(old_c, new_c)
         refresh_readmes(data_dir, pid)
         refresh_readmes(data_dir, to_pid)
         refresh_vocabulary(data_dir)
     _notify("移动「%s」到「%s」" % (it.get("title", "")[:50], dst.get("name", to_pid)))
     return dict(it)
+
+
+# ----------------------------------------------------------------- 资源（SPEC §13.2）
+def _sync_state_resources(data_dir, p, it):
+    """资源变化后：更新论文状态里的 meta.resources，重写 md 与项目 README。调用方持锁。"""
+    if it.get("type") in STATEFUL_TYPES and it.get("paper_key"):
+        st = _load_state(data_dir, p["id"], it["paper_key"])
+        if st is not None:
+            st["meta"]["resources"] = item_resources(it)
+            _write_state(data_dir, p["id"], st, p)
+    refresh_readmes(data_dir, p["id"])
+
+
+def add_resource(data_dir, pid, iid, res_dict):
+    r = dict(res_dict or {})
+    with _LOCK:
+        p = _load_project(data_dir, pid)
+        it = _find(p, iid)
+        if it.get("type") not in STATEFUL_TYPES:
+            raise ValueError("只有论文和网页条目可以关联资源")
+        nr = _norm_resource(r)
+        if nr is None:
+            raise ValueError("资源链接不能为空")
+        if _same_url(nr["url"], it.get("url")) or _same_url(nr["url"], it.get("pdf_url")):
+            out = {"id": "main", "kind": it.get("kind") or "paper", "url": it.get("url"), "title": it.get("title"),
+                   "auto": False, "existing": True}
+            return out
+        res = it.setdefault("resources", [])
+        for x in res:
+            if _same_url(x.get("url"), nr["url"]):
+                out = dict(x)
+                out["existing"] = True
+                return out
+        res.append(nr)
+        it["updated"] = config.now_iso()
+        p["updated"] = it["updated"]
+        _save_project(data_dir, p, refresh=False)
+        _sync_state_resources(data_dir, p, it)
+    _notify("关联资源「%s」→「%s」" % ((nr.get("title") or nr["url"])[:40], it.get("title", "")[:40]))
+    out = dict(nr)
+    out["existing"] = False
+    return out
+
+
+def update_resource(data_dir, pid, iid, rid, patch):
+    patch = patch or {}
+    with _LOCK:
+        p = _load_project(data_dir, pid)
+        it = _find(p, iid)
+        for x in it.get("resources") or []:
+            if x.get("id") == rid:
+                if patch.get("kind") is not None:
+                    if patch["kind"] not in RESOURCE_KINDS:
+                        raise ValueError("未知的资源类型：%s" % patch["kind"])
+                    x["kind"] = patch["kind"]
+                if patch.get("title") is not None:
+                    x["title"] = str(patch["title"]).strip()[:300]
+                if patch.get("url"):
+                    x["url"] = str(patch["url"]).strip()
+                if "auto" in patch:
+                    x["auto"] = bool(patch["auto"])
+                it["updated"] = config.now_iso()
+                p["updated"] = it["updated"]
+                _save_project(data_dir, p, refresh=False)
+                _sync_state_resources(data_dir, p, it)
+                out = dict(x)
+                break
+        else:
+            raise NotFound("资源不存在：%s" % rid)
+    _notify("修改资源「%s」" % (out.get("title") or out.get("url") or "")[:50])
+    return out
+
+
+def delete_resource(data_dir, pid, iid, rid):
+    with _LOCK:
+        p = _load_project(data_dir, pid)
+        it = _find(p, iid)
+        res = it.get("resources") or []
+        target = next((x for x in res if x.get("id") == rid), None)
+        if target is None:
+            raise NotFound("资源不存在：%s" % rid)
+        it["resources"] = [x for x in res if x.get("id") != rid]
+        it["updated"] = config.now_iso()
+        p["updated"] = it["updated"]
+        _save_project(data_dir, p, refresh=False)
+        if it.get("paper_key"):
+            st = _load_state(data_dir, pid, it["paper_key"])
+            if st is not None:
+                gone = set(a["id"] for a in st["annotations"] if a.get("resource_id") == rid)
+                st["annotations"] = [a for a in st["annotations"] if a["id"] not in gone]
+                for n in st["notes"]:
+                    if n.get("resource_id") == rid:
+                        n["resource_id"] = "main"
+                        n.pop("anchor", None)
+                        n["detached_from"] = target.get("title") or target.get("url")
+                    if n.get("annotation_id") in gone:
+                        n["annotation_id"] = None
+                for v in st.get("vocab") or []:
+                    if v.get("annotation_id") in gone:
+                        v["annotation_id"] = None
+                st["meta"]["resources"] = item_resources(it)
+                _write_state(data_dir, pid, st, p)
+            cf = _cache_file(data_dir, pid, it["paper_key"], rid)
+            if os.path.exists(cf):
+                os.remove(cf)
+        refresh_readmes(data_dir, pid)
+        refresh_vocabulary(data_dir)
+    _notify("移除资源「%s」" % (target.get("title") or target.get("url") or "")[:50])
 
 
 # ----------------------------------------------------------------- 论文状态
@@ -481,6 +670,10 @@ def _blank_state(pid, item):
             "arxiv_id": item.get("arxiv_id"),
             "year": item.get("year"),
             "abstract": item.get("abstract"),
+            "type": item.get("type"),
+            "kind": item.get("kind"),
+            "site_name": item.get("site_name") or "",
+            "description": item.get("description") or "",
         },
         "annotations": [],
         "notes": [],
@@ -539,13 +732,22 @@ def _paper_ctx(data_dir, pid, iid):
     """返回 (project, item, state)，必要时初始化 state。调用方需持锁。"""
     p = _load_project(data_dir, pid)
     it = _find(p, iid)
-    if it.get("type") != "paper":
-        raise ValueError("这个条目不是论文")
+    if it.get("type") not in STATEFUL_TYPES:
+        raise ValueError("这个条目不是论文或网页")
+    if not it.get("paper_key"):
+        # 旧版本的 link 条目没有 paper_key：补上并保存
+        from .fetcher import web_key_for, classify
+        it["paper_key"] = web_key_for(it.get("url") or it["id"])
+        it.setdefault("kind", classify(it.get("url") or ""))
+        _save_project(data_dir, p, refresh=False)
     st = _load_state(data_dir, pid, it["paper_key"])
     if st is None:
         st = _init_paper_state(data_dir, p, it)
     # 让 meta 跟随条目最新信息
     st["meta"]["title"] = it.get("title") or st["meta"].get("title")
+    st["meta"]["type"] = it.get("type")
+    st["meta"]["kind"] = it.get("kind") or st["meta"].get("kind")
+    st["meta"]["resources"] = item_resources(it)
     st["iid"] = it["id"]
     st["pid"] = pid
     return p, it, st
@@ -608,6 +810,36 @@ def update_paper(data_dir, pid, iid, patch, notify=True):
         return st
 
 
+def _rid(d):
+    r = (d or {}).get("resource_id")
+    r = str(r).strip() if r not in (None, "") else "main"
+    return r[:40] if re.match(r"^[A-Za-z0-9_\-]+$", r) else "main"
+
+
+def _anchor(a):
+    """网页标注的文本锚点：{type:"text", exact, prefix, suffix, start, end}；不合法返回 None。"""
+    if not isinstance(a, dict):
+        return None
+    exact = str(a.get("exact") or "")
+    if not exact.strip():
+        return None
+    out = {"type": "text", "exact": exact[:4000], "prefix": str(a.get("prefix") or "")[-64:],
+           "suffix": str(a.get("suffix") or "")[:64]}
+    for k in ("start", "end"):
+        try:
+            out[k] = max(0, int(a.get(k)))
+        except (TypeError, ValueError):
+            out[k] = None
+    return out
+
+
+def _page_or_none(v):
+    try:
+        return int(v) if v not in (None, "") else None
+    except (TypeError, ValueError):
+        return None
+
+
 def _norm_rects(rects):
     out = []
     for r in rects or []:
@@ -635,10 +867,16 @@ def add_annotation(data_dir, pid, iid, ann):
         color = "yellow"
     with _LOCK:
         p, it, st = _paper_ctx(data_dir, pid, iid)
+        anchor = _anchor(ann.get("anchor"))
+        page = _page_or_none(ann.get("page"))
+        if page is None and anchor is None:
+            page = 1
         a = {"id": _new_id("h_"), "kind": kind, "color": color,
-             "page": int(ann.get("page") or 1), "quote": (ann.get("quote") or "").strip(),
+             "page": page, "quote": (ann.get("quote") or (anchor or {}).get("exact") or "").strip(),
              "rects": _norm_rects(ann.get("rects")), "comment": ann.get("comment") or "",
-             "created": config.now_iso()}
+             "resource_id": _rid(ann), "created": config.now_iso()}
+        if anchor:
+            a["anchor"] = anchor
         st["annotations"].append(a)
         if st.get("status") == "unread":
             st["status"] = "reading"
@@ -693,7 +931,10 @@ def add_note(data_dir, pid, iid, note_dict):
         now = config.now_iso()
         n = {"id": _new_id("n_"), "page": page, "quote": (nd.get("quote") or "").strip(),
              "text": text, "source": src, "annotation_id": nd.get("annotation_id") or None,
-             "created": now, "updated": now}
+             "resource_id": _rid(nd), "created": now, "updated": now}
+        anchor = _anchor(nd.get("anchor"))
+        if anchor:
+            n["anchor"] = anchor
         st["notes"].append(n)
         if st.get("status") == "unread":
             st["status"] = "reading"
@@ -744,7 +985,10 @@ def add_qa(data_dir, pid, iid, qa_dict):
         item = {"id": _new_id("q_"), "question": q.get("question") or "", "answer": q.get("answer") or "",
                 "engine": q.get("engine") or "claude", "mode": q.get("mode") or "ask",
                 "style": q.get("style") if q.get("style") in ("voice",) else "text",
-                "quote": q.get("quote") or "", "page": page, "at": config.now_iso()}
+                "quote": q.get("quote") or "", "page": page, "resource_id": _rid(q), "at": config.now_iso()}
+        anchor = _anchor(q.get("anchor"))
+        if anchor:
+            item["anchor"] = anchor
         st["qa"].append(item)
         if st.get("status") == "unread":
             st["status"] = "reading"
@@ -772,7 +1016,7 @@ def add_translation(data_dir, pid, iid, tr):
         except (TypeError, ValueError):
             page = None
         t = {"id": _new_id("t_"), "source": tr.get("source") or "", "translation": tr.get("translation") or "",
-             "engine": tr.get("engine") or "", "page": page, "at": config.now_iso()}
+             "engine": tr.get("engine") or "", "page": page, "resource_id": _rid(tr), "at": config.now_iso()}
         st["translations"].append(t)
         st["translations"] = st["translations"][-200:]
         # 翻译记录不进 Markdown 笔记，也不单独触发同步（随下次提交一起）
@@ -839,7 +1083,7 @@ def add_vocab(data_dir, pid, iid, entry):
                 extra = v.setdefault("extra_contexts", [])
                 known = [v.get("context")] + [x.get("context") for x in extra]
                 if context and context not in known:
-                    extra.append({"context": context, "page": page,
+                    extra.append({"context": context, "page": page, "resource_id": _rid(e),
                                   "annotation_id": e.get("annotation_id") or None,
                                   "context_translation": e.get("context_translation") or "",
                                   "created": config.now_iso()})
@@ -856,10 +1100,13 @@ def add_vocab(data_dir, pid, iid, entry):
              "phonetic": e.get("phonetic") or "", "pos": e.get("pos") or "",
              "meaning": e.get("meaning") or "", "context_meaning": e.get("context_meaning") or "",
              "context": context, "context_translation": e.get("context_translation") or "",
-             "page": page, "annotation_id": e.get("annotation_id") or None,
+             "page": page, "annotation_id": e.get("annotation_id") or None, "resource_id": _rid(e),
              "created": now, "updated": now, "mastered": False,
              "lookup_error": e.get("lookup_error") or None, "engine": e.get("engine") or None,
              "extra_contexts": []}
+        anchor = _anchor(e.get("anchor"))
+        if anchor:
+            v["anchor"] = anchor
         st["vocab"].append(v)
         if st.get("status") == "unread":
             st["status"] = "reading"
@@ -920,7 +1167,7 @@ def list_all_vocab(data_dir, mastered=None, pid=None):
             except NotFound:
                 continue
             for it in proj["items"]:
-                if it.get("type") != "paper" or not it.get("paper_key"):
+                if it.get("type") not in STATEFUL_TYPES or not it.get("paper_key"):
                     continue
                 st = _load_state(data_dir, proj["id"], it["paper_key"])
                 if not st:
@@ -942,7 +1189,8 @@ def _bold_word(context, word):
     ctx = _md_inline(context)
     if not word:
         return ctx
-    m = re.search(re.escape(word), ctx, re.I)
+    # 优先匹配完整的词（skim 不应加粗 Skimmer 的前半截），找不到再退回普通匹配
+    m = re.search(r"(?<![\w])" + re.escape(word) + r"(?![\w])", ctx, re.I) or re.search(re.escape(word), ctx, re.I)
     if not m:
         return ctx
     return ctx[:m.start()] + "**" + m.group(0) + "**" + ctx[m.end():]
@@ -1026,29 +1274,52 @@ def refresh_vocabulary(data_dir):
 
 
 # ----------------------------------------------------------------- 全文缓存
-def _cache_file(data_dir, pid, key):
-    return os.path.join(data_dir, ".cache", "text", pid, key + ".json")
+def _cache_file(data_dir, pid, key, rid="main"):
+    rid = rid or "main"
+    name = key + (".json" if rid == "main" else "@%s.json" % rid)
+    return os.path.join(data_dir, ".cache", "text", pid, name)
 
 
-def write_cached_text(data_dir, pid, paper_key, pages):
+def write_cached_text(data_dir, pid, paper_key, pages, resource_id="main", title=None, kind=None):
+    """pages：[{page, text}]（PDF 按页；网页 / README 通常只有 page=1 一段）。"""
     clean = []
-    for pg in pages or []:
+    for i, pg in enumerate(pages or []):
         try:
-            n = int(pg.get("page"))
+            n = int(pg.get("page") if pg.get("page") is not None else i + 1)
         except (TypeError, ValueError, AttributeError):
             continue
         clean.append({"page": n, "text": str(pg.get("text") or "")})
     clean.sort(key=lambda x: x["page"])
-    config.atomic_write_json(_cache_file(data_dir, pid, paper_key),
-                             {"pages": clean, "at": config.now_iso()})
+    rid = _rid({"resource_id": resource_id})
+    config.atomic_write_json(_cache_file(data_dir, pid, paper_key, rid),
+                             {"pages": clean, "resource_id": rid, "title": title or "", "kind": kind or "",
+                              "at": config.now_iso()})
     return sum(len(x["text"]) for x in clean)
 
 
-def read_cached_text(data_dir, pid, paper_key):
-    d = config.read_json(_cache_file(data_dir, pid, paper_key))
+def _read_cache_obj(data_dir, pid, paper_key, rid="main"):
+    d = config.read_json(_cache_file(data_dir, pid, paper_key, rid))
     if not isinstance(d, dict) or not d.get("pages"):
         return None
-    return d["pages"]
+    return d
+
+
+def read_cached_text(data_dir, pid, paper_key, resource_id="main"):
+    d = _read_cache_obj(data_dir, pid, paper_key, resource_id or "main")
+    return d["pages"] if d else None
+
+
+def cached_resources(data_dir, pid, paper_key):
+    folder = os.path.join(data_dir, ".cache", "text", pid)
+    out = []
+    if not os.path.isdir(folder):
+        return out
+    for name in sorted(os.listdir(folder)):
+        if name == paper_key + ".json":
+            out.insert(0, "main")
+        elif name.startswith(paper_key + "@") and name.endswith(".json"):
+            out.append(name[len(paper_key) + 1:-5])
+    return out
 
 
 def _parse_pages(spec):
@@ -1084,6 +1355,39 @@ def cached_text_string(data_dir, pid, paper_key, pages=None):
         if want and pg["page"] not in want:
             continue
         parts.append("\n\n===== [p.%d] =====\n%s" % (pg["page"], pg["text"]))
+    return "".join(parts).strip() + "\n"
+
+
+_RES_LABEL = {"paper": "论文 PDF", "code": "代码 README", "homepage": "主页", "blog": "网页", "video": "视频",
+              "slides": "幻灯片", "dataset": "数据集", "model": "模型", "demo": "Demo", "other": "网页"}
+
+
+def agent_text_string(data_dir, pid, item):
+    """给 agent 的 paper.txt 正文：主资源（PDF 按页 / 网页 / README）+ 每个有缓存的关联资源。"""
+    key = item.get("paper_key")
+    if not key:
+        return None
+    parts = []
+    for r in item_resources(item):
+        d = _read_cache_obj(data_dir, pid, key, r["id"])
+        if not d:
+            continue
+        kind = d.get("kind") or r.get("kind") or ("paper" if item.get("type") == "paper" else "blog")
+        title = d.get("title") or r.get("title") or r.get("url") or ""
+        is_pdf = kind == "paper" and (r["id"] != "main" or item.get("type") == "paper")
+        if r["id"] == "main" and is_pdf:
+            for pg in d["pages"]:
+                parts.append("\n\n===== [p.%d] =====\n%s" % (pg["page"], pg["text"]))
+        elif is_pdf:
+            for pg in d["pages"]:
+                parts.append("\n\n===== [论文 PDF：%s · p.%d] =====\n%s" % (title, pg["page"], pg["text"]))
+        else:
+            label = "代码 README" if kind == "code" else ("网页" if kind in ("blog", "homepage", "other") else
+                                                         _RES_LABEL.get(kind, "网页"))
+            body = "\n\n".join(pg["text"] for pg in d["pages"])
+            parts.append("\n\n===== [%s：%s] =====\n%s" % (label, title, body))
+    if not parts:
+        return None
     return "".join(parts).strip() + "\n"
 
 
@@ -1134,6 +1438,50 @@ def _md_inline(text):
     return " ".join(str(text or "").split()).replace("|", "\\|")
 
 
+_RES_EMOJI = {"paper": "📄", "code": "💻", "homepage": "🏠", "blog": "📝", "video": "🎬", "model": "🤗",
+              "dataset": "🤗", "demo": "🤗", "slides": "🖼️", "other": "🔗"}
+_RES_NAME = {"paper": "论文", "code": "代码", "homepage": "主页", "blog": "博客", "video": "视频", "model": "模型",
+             "dataset": "数据集", "demo": "Demo", "slides": "幻灯片", "other": "链接"}
+
+
+def _md_link_text(t):
+    return _md_inline(t).replace("[", "\\[").replace("]", "\\]")
+
+
+def _short(t, n=40):
+    t = " ".join(str(t or "").split())
+    return t if len(t) <= n else t[:n - 1] + "…"
+
+
+def _res_label(r, with_title=True):
+    kind = r.get("kind") or "other"
+    name = _RES_NAME.get(kind, "链接")
+    title = (r.get("title") or "").strip()
+    if with_title and title and title != r.get("url") and not title.startswith("arXiv:"):
+        if r.get("id") != "main" or kind not in ("paper",):
+            name += "：" + _short(title)
+    return name
+
+
+def _resources_line(resources):
+    if not resources or len(resources) < 2:
+        return None
+    counts = {}
+    for r in resources:
+        counts[r.get("kind")] = counts.get(r.get("kind"), 0) + 1
+    bits = []
+    for r in resources:
+        kind = r.get("kind") or "other"
+        with_title = counts.get(kind, 0) > 1 or kind in ("blog", "homepage", "other")
+        bits.append("%s [%s](%s)" % (_RES_EMOJI.get(kind, "🔗"), _md_link_text(_res_label(r, with_title)), r.get("url")))
+    return "**相关资源**：" + " · ".join(bits)
+
+
+def _res_heading(r):
+    kind = r.get("kind") or "other"
+    return "%s %s" % (_RES_EMOJI.get(kind, "🔗"), _res_label(r, True))
+
+
 def pages_url_of(settings):
     u = ((settings or {}).get("pages_url") or "").strip()
     return (u.rstrip("/") + "/") if u else ""
@@ -1171,6 +1519,14 @@ def render_paper_markdown(state, project_name="", app_url="http://localhost:8765
         links.append("[📄 PDF](%s)" % meta["pdf_url"])
     lines.append(" · ".join(links))
     lines.append("")
+    resources = meta.get("resources") or []
+    rl = _resources_line(resources)
+    if rl:
+        lines.append(rl)
+        lines.append("")
+    if meta.get("type") in ("web", "link") and meta.get("description"):
+        lines.append("> " + _md_inline(meta["description"]))
+        lines.append("")
     info = []
     if authors:
         a = ", ".join(authors[:6]) + (" 等" if len(authors) > 6 else "")
@@ -1206,23 +1562,54 @@ def render_paper_markdown(state, project_name="", app_url="http://localhost:8765
                                                  _short_time(summ.get("at"))))
         lines.append("")
 
+    known_rids = [r.get("id") for r in resources] or ["main"]
+    res_by_id = dict((r.get("id"), r) for r in resources)
+
+    def rid_of(x):
+        r = x.get("resource_id") or "main"
+        return r if r in res_by_id or not resources else "main"
+
+    def groups(records):
+        """按资源分组；只有主资源时返回 [(None, records)]（保持旧格式）。"""
+        if not any(rid_of(x) != "main" for x in records):
+            return [(None, records)]
+        out = []
+        for rid in known_rids:
+            sub = [x for x in records if rid_of(x) == rid]
+            if sub:
+                out.append((res_by_id.get(rid), sub))
+        return out
+
+    is_web = meta.get("type") in ("web", "link")
     notes = sorted(st.get("notes") or [], key=_page_key)
     lines.append("## 📝 笔记")
     lines.append("")
     if not notes:
         lines.append("_还没有笔记。_")
         lines.append("")
-    for n in notes:
-        head = "p.%d" % n["page"] if isinstance(n.get("page"), int) else "全文"
-        lines.append("#### 📌 %s · %s · %s" % (head, _SOURCE_LABEL.get(n.get("source"), "手写"),
-                                               _short_time(n.get("created"))))
-        lines.append("")
-        if n.get("quote"):
-            lines.append(_quote_block(n["quote"]))
+    for res, sub in groups(notes):
+        if res is not None:
+            lines.append("### " + _res_heading(res))
             lines.append("")
-        if n.get("text"):
-            lines.append(n["text"].strip())
+        for n in sub:
+            if isinstance(n.get("page"), int):
+                head = "p.%d" % n["page"]
+            elif n.get("anchor") or is_web or (res is not None and res.get("id") != "main"):
+                head = "原文" if n.get("quote") else "全文"
+            else:
+                head = "全文"
+            lines.append("#### 📌 %s · %s · %s" % (head, _SOURCE_LABEL.get(n.get("source"), "手写"),
+                                                   _short_time(n.get("created"))))
             lines.append("")
+            if n.get("quote"):
+                lines.append(_quote_block(n["quote"]))
+                lines.append("")
+            if n.get("text"):
+                lines.append(n["text"].strip())
+                lines.append("")
+            if n.get("detached_from"):
+                lines.append("<sub>（原关联资源「%s」已移除）</sub>" % _md_inline(n["detached_from"]))
+                lines.append("")
 
     anns = sorted([a for a in st.get("annotations") or [] if a.get("kind") != "vocab"], key=_page_key)
     lines.append("## 🖍️ 标注")
@@ -1230,7 +1617,17 @@ def render_paper_markdown(state, project_name="", app_url="http://localhost:8765
     if not anns:
         lines.append("_还没有标注。_")
         lines.append("")
-    for a in anns:
+    ann_rows = []
+    for res, sub in groups(anns):
+        if res is not None:
+            ann_rows.append(("head", res))
+        ann_rows.extend(("ann", a) for a in sub)
+    for kind_row, a in ann_rows:
+        if kind_row == "head":
+            lines.append("")
+            lines.append("**%s**" % _md_inline(_res_heading(a)))
+            lines.append("")
+            continue
         q = _md_inline(a.get("quote") or "（图形区域）")
         kind = a.get("kind")
         if kind == "underline":
@@ -1241,8 +1638,8 @@ def render_paper_markdown(state, project_name="", app_url="http://localhost:8765
             qtext = "<ins>*“%s”*</ins>" % q
         else:
             qtext = "“%s”" % q
-        line = "- **p.%s** %s %s：%s" % (a.get("page"), _COLOR_EMOJI.get(a.get("color"), "🟨"),
-                                         _KIND_LABEL.get(kind, "高亮"), qtext)
+        loc = ("**p.%s** " % a.get("page")) if isinstance(a.get("page"), int) else ""
+        line = "- %s%s %s：%s" % (loc, _COLOR_EMOJI.get(a.get("color"), "🟨"), _KIND_LABEL.get(kind, "高亮"), qtext)
         lines.append(line)
         if a.get("comment"):
             for cl in a["comment"].strip().splitlines():
@@ -1307,7 +1704,8 @@ def render_paper_markdown(state, project_name="", app_url="http://localhost:8765
         lines.append((q.get("answer") or "").strip() or "_（无回答）_")
         lines.append("")
     lines.append("---")
-    lines.append("<sub>由 PaperDesk 自动生成。PDF 不保存在本仓库，打开时从原链接实时加载。</sub>")
+    lines.append("<sub>由 PaperDesk 自动生成。%s不保存在本仓库，打开时从原链接实时加载。</sub>"
+                 % ("网页正文" if is_web else "PDF"))
     lines.append("")
     return "\n".join(lines)
 
@@ -1322,14 +1720,21 @@ def paper_markdown(data_dir, pid, iid):
 def _render_project_readme(data_dir, p, app_url, pages_url=""):
     items = p.get("items") or []
     papers = [i for i in items if i.get("type") == "paper"]
-    links = [i for i in items if i.get("type") == "link"]
+    links = [i for i in items if i.get("type") in ("web", "link")]
     notes = [i for i in items if i.get("type") == "note"]
+
+    def res_icons(it):
+        rs = it.get("resources") or []
+        if not rs:
+            return ""
+        return " ".join("[%s](%s \"%s\")" % (_RES_EMOJI.get(r.get("kind"), "🔗"), r.get("url"),
+                                                _md_inline(_res_label(r)).replace('"', "'")) for r in rs)
     L = ["# 📁 " + _md_inline(p.get("name") or p["id"]), ""]
     if p.get("description"):
         L.append(_quote_block(p["description"]))
         L.append("")
     online = (" · [🌐 在线只读版](%s#/p/%s)" % (pages_url, p["id"])) if pages_url else ""
-    L.append("[🗂️ 在 PaperDesk 中打开这个项目（本地）](%s/p/%s)%s · 论文 %d 篇 · 链接 %d 个 · 笔记 %d 条 · [⬅️ 返回全部项目](../../README.md)"
+    L.append("[🗂️ 在 PaperDesk 中打开这个项目（本地）](%s/p/%s)%s · 论文 %d 篇 · 网页 / 链接 %d 个 · 笔记 %d 条 · [⬅️ 返回全部项目](../../README.md)"
              % (app_url, p["id"], online, len(papers), len(links), len(notes)))
     L.append("")
     L.append("## 📄 论文")
@@ -1349,6 +1754,9 @@ def _render_project_readme(data_dir, p, app_url, pages_url=""):
             if it.get("tags"):
                 sub.append(" ".join("`#%s`" % _md_inline(t) for t in it["tags"]))
             cell = "[%s](%s)" % (title, href) if href else title
+            icons = res_icons(it)
+            if icons:
+                sub.append(icons)
             if sub:
                 cell += "<br><sub>%s</sub>" % " · ".join(sub)
             key = it.get("paper_key")
@@ -1367,16 +1775,40 @@ def _render_project_readme(data_dir, p, app_url, pages_url=""):
     else:
         L.append("_还没有论文。_")
         L.append("")
-    L.append("## 🔗 链接")
+    L.append("## 🌐 网页与链接")
     L.append("")
     if links:
+        L.append("| 类型 | 网页 | 阅读 | 笔记 | 添加于 |")
+        L.append("|:---:|---|:---:|:---:|:---:|")
         for it in links:
-            tags = (" " + " ".join("`#%s`" % _md_inline(t) for t in it["tags"])) if it.get("tags") else ""
-            L.append("- [%s](%s)%s <sub>%s</sub>" % (_md_inline(it.get("title") or it.get("url")), it.get("url"),
-                                                     tags, (it.get("added") or "")[:10]))
+            kind = it.get("kind") or "blog"
+            title = _md_inline(it.get("title") or it.get("url"))
+            cell = "[%s](%s)" % (title, it.get("url"))
+            sub = []
+            if it.get("site_name"):
+                sub.append(_md_inline(it["site_name"]))
+            if it.get("tags"):
+                sub.append(" ".join("`#%s`" % _md_inline(t) for t in it["tags"]))
+            icons = res_icons(it)
+            if icons:
+                sub.append(icons)
+            if sub:
+                cell += "<br><sub>%s</sub>" % " · ".join(sub)
+            key = it.get("paper_key")
+            st = _load_state(data_dir, p["id"], key) if key else None
+            note_cell = ""
+            if st is not None:
+                n = len(st.get("notes") or []) + len(st.get("annotations") or [])
+                note_cell = "[📝 笔记%s](papers/%s.md)" % (" (%d)" % n if n else "", key)
+            read_cell = "[📖 本地打开](%s/r/%s/%s)" % (app_url, p["id"], it["id"])
+            if pages_url:
+                read_cell += "<br>[🌐 在线只读](%s#/r/%s/%s)" % (pages_url, p["id"], it["id"])
+            L.append("| %s %s | %s | %s | %s | %s |" % (
+                _RES_EMOJI.get(kind, "🔗"), _RES_NAME.get(kind, "链接"), cell, read_cell, note_cell,
+                (it.get("added") or "")[:10]))
         L.append("")
     else:
-        L.append("_还没有链接。_")
+        L.append("_还没有网页或链接。_")
         L.append("")
     L.append("## 🗒️ 笔记")
     L.append("")
@@ -1450,9 +1882,10 @@ def rerender_all(data_dir):
         for s in list_projects(data_dir):
             p = _load_project(data_dir, s["id"])
             for it in p["items"]:
-                if it.get("type") == "paper" and it.get("paper_key"):
+                if it.get("type") in STATEFUL_TYPES and it.get("paper_key"):
                     st = _load_state(data_dir, p["id"], it["paper_key"])
                     if st is not None:
+                        st["meta"]["resources"] = item_resources(it)
                         _write_state(data_dir, p["id"], st, p)
         refresh_readmes(data_dir)
         refresh_vocabulary(data_dir)

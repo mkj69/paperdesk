@@ -54,7 +54,9 @@ def cli_status(settings):
 # ----------------------------------------------------------------- 工作目录
 def _instructions(settings, has_text):
     lang = settings.get("answer_lang") or "中文"
-    src = ("论文全文在 ./paper.txt，每页以 `===== [p.N] =====` 分隔。需要细节时用 Read / Grep 查找相关段落再回答。"
+    src = ("论文全文在 ./paper.txt：PDF 每页以 `===== [p.N] =====` 分隔；如果这篇工作还关联了博客、项目主页或代码仓库，"
+           "它们的正文 / README 也在里面，以 `===== [网页：标题] =====`、`===== [代码 README：仓库] =====` 开头。"
+           "需要细节时用 Read / Grep 查找相关段落再回答。"
            if has_text else
            "注意：./paper.txt 里暂时只有论文元数据和摘要（全文还没抽取完成）。如果问题需要细节，请说明你只看到了摘要。")
     return """# PaperDesk 论文阅读助手
@@ -64,7 +66,7 @@ def _instructions(settings, has_text):
 - {src}
 - 用户自己的笔记、标注和以前的问答在 ./notes.md，可以参考它理解用户关心什么。
 - 回答使用{lang}；专业术语第一次出现时在括号里保留英文。
-- 引用或依据原文时注明页码，例如（p.4）。
+- 引用或依据原文时注明出处：PDF 写页码，例如（p.4）；网页或 README 写来源，例如（博客）（README）。
 - 数学公式用 LaTeX：行内 `$...$`，独立公式 `$$...$$`。
 - 用 Markdown 组织回答：该加粗的关键结论要加粗，必要时用列表或小标题；不要冗长的开场白。
 - 只读：不要创建、修改或删除任何文件，不要运行命令。
@@ -75,7 +77,12 @@ def prepare_workdir(data_dir, pid, state, settings):
     key = state["paper_key"]
     wd = os.path.join(data_dir, ".agent", pid, key)
     os.makedirs(wd, exist_ok=True)
-    text = store.cached_text_string(data_dir, pid, key)
+    try:
+        item = store.find_item(data_dir, pid, state["iid"])
+        text = store.agent_text_string(data_dir, pid, item)
+    except Exception:
+        item = None
+        text = store.cached_text_string(data_dir, pid, key)
     meta = state.get("meta") or {}
     if text:
         header = "标题：%s\n作者：%s\n链接：%s\n" % (meta.get("title") or "", ", ".join(meta.get("authors") or []),
@@ -99,12 +106,29 @@ def prepare_workdir(data_dir, pid, state, settings):
     return wd
 
 
-def build_ask_prompt(question, quote=None, page=None, mode="ask", style="text", answer_lang="中文"):
+_RES_NAMES = {"paper": "论文 PDF", "code": "代码仓库 README", "homepage": "项目主页", "blog": "博客", "video": "视频",
+              "slides": "幻灯片", "dataset": "数据集页面", "model": "模型页面", "demo": "Demo 页面", "other": "网页"}
+
+
+def resource_label(res):
+    """资源的中文称呼，例如「博客《标题》」，用于提示词里说明引文出处。"""
+    name = _RES_NAMES.get((res or {}).get("kind") or "other", "网页")
+    title = ((res or {}).get("title") or "").strip()
+    if title and title != (res or {}).get("url"):
+        return "%s《%s》" % (name, title[:80])
+    return name
+
+
+def build_ask_prompt(question, quote=None, page=None, mode="ask", style="text", answer_lang="中文",
+                     source_label=None):
     q = (question or "").strip()
     parts = []
     if quote:
-        loc = "（第 %s 页）" % page if page else ""
-        parts.append("我在论文中选中了这段原文%s：\n\n\"\"\"\n%s\n\"\"\"\n" % (loc, quote.strip()))
+        if source_label:
+            parts.append("我在%s中选中了这段原文：\n\n\"\"\"\n%s\n\"\"\"\n" % (source_label, quote.strip()))
+        else:
+            loc = "（第 %s 页）" % page if page else ""
+            parts.append("我在论文中选中了这段原文%s：\n\n\"\"\"\n%s\n\"\"\"\n" % (loc, quote.strip()))
     if mode == "explain":
         parts.append("请结合论文上下文，用通俗但准确的方式解释这段话：它在说什么、为什么这么做、涉及的符号/公式分别是什么意思。"
                      + ("\n\n补充要求：" + q if q else ""))
@@ -117,7 +141,7 @@ def build_ask_prompt(question, quote=None, page=None, mode="ask", style="text", 
 
 
 def build_archive_prompt(state):
-    return """我已经读完这篇论文了。请阅读 ./paper.txt（论文全文）和 ./notes.md（我的笔记、标注和问答），
+    return """我已经读完这篇论文了。请阅读 ./paper.txt（论文全文；如果这篇工作还关联了博客、项目主页或代码仓库，它们的正文 / README 也在里面）和 ./notes.md（我的笔记、标注和问答），
 为我写一份可以长期保存的中文精读总结（Markdown）。要求：
 
 1. 使用下面这些二级以下的小标题（用 ###），不要输出一级/二级标题：

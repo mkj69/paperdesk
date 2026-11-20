@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="720" height="220" viewBox="0 0 720 220">
+<rect width="720" height="220" fill="#faf8f3"/>
+<g font-family="Helvetica, Arial, sans-serif" font-size="13" fill="#3d3d3a">
+<text x="24" y="34" font-size="15" font-weight="bold">Token budgets across a document</text>
+<g>
+<rect x="24" y="60" width="40" height="110" fill="#d9d4c7"/><rect x="70" y="140" width="40" height="30" fill="#d9d4c7"/>
+<rect x="116" y="150" width="40" height="20" fill="#d9d4c7"/><rect x="162" y="70" width="40" height="100" fill="#c26b4a"/>
+<rect x="208" y="58" width="40" height="112" fill="#c26b4a"/><rect x="254" y="132" width="40" height="38" fill="#d9d4c7"/>
+<rect x="300" y="155" width="40" height="15" fill="#d9d4c7"/><rect x="346" y="64" width="40" height="106" fill="#c26b4a"/>
+<rect x="392" y="146" width="40" height="24" fill="#d9d4c7"/><rect x="438" y="152" width="40" height="18" fill="#d9d4c7"/>
+<rect x="484" y="90" width="40" height="80" fill="#c26b4a"/><rect x="530" y="158" width="40" height="12" fill="#d9d4c7"/>
+<rect x="576" y="160" width="40" height="10" fill="#d9d4c7"/><rect x="622" y="161" width="40" height="9" fill="#d9d4c7"/>
+</g>
+<text x="24" y="195">title</text><text x="162" y="195">definition</text><text x="346" y="195">key result</text><text x="576" y="195">references</text>
+</g></svg>

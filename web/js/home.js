@@ -7,7 +7,7 @@ export async function mountHome(root) {
   const page = h('div', { class: 'page' });
   root.append(page);
 
-  const input = h('input', { type: 'text', placeholder: '粘贴 arXiv ID / arXiv 链接 / PDF 链接 / 任意网页，回车加入收件箱' });
+  const input = h('input', { type: 'text', placeholder: '粘贴 arXiv ID / PDF / 博客 / GitHub 链接（可一次粘贴多个：论文 + 代码 + 主页），回车加入收件箱' });
   const addBtn = h('button', { class: 'btn btn-primary btn-sm' }, '加入收件箱');
   const add = async () => {
     const v = input.value.trim();
@@ -18,7 +18,7 @@ export async function mountHome(root) {
       input.value = '';
       await refreshProjects();
       toast(it.existing ? '收件箱里已经有这篇了' : `已加入收件箱：${it.title || v}`, 'ok');
-      if (it.type === 'paper') navigate(`/r/inbox/${encodeURIComponent(it.id)}`);
+      if (it.type === 'paper' || it.type === 'web') navigate(`/r/inbox/${encodeURIComponent(it.id)}`);
     } catch (e) {
       toastError(e);
     } finally {
@@ -37,7 +37,7 @@ export async function mountHome(root) {
       grid.append(h('a', { class: 'proj-tile', href: appHref(`/p/${encodeURIComponent(p.id)}`), 'data-link': '' },
         h('div', { class: 'pt-name' }, p.name),
         h('div', { class: 'pt-desc' }, p.description || ''),
-        h('div', { class: 'pt-counts' }, `${c.paper || 0} 篇论文 · ${c.link || 0} 个链接 · ${c.note || 0} 条笔记`)));
+        h('div', { class: 'pt-counts' }, `${c.paper || 0} 篇论文 · ${(c.web || 0) + (c.link || 0)} 个网页 · ${c.note || 0} 条笔记`)));
     }
     if (!STATIC) grid.append(h('button', { class: 'proj-tile', style: { textAlign: 'left', border: '1px dashed var(--border-2)', background: 'transparent' }, onclick: () => newProject() },
       h('div', { class: 'pt-name', style: { display: 'flex', alignItems: 'center', gap: '6px' } }, icon('plus', 16), '新建项目'),
