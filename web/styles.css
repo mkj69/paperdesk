@@ -640,6 +640,12 @@ a.btn-primary, a.btn-primary:hover { color: var(--bg-2); }
 .av-desc { font-size: 15px; color: var(--text-2); margin: 0 0 10px; }
 .av-meta { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 16px; font-size: 13px; color: var(--text-2); }
 .av-meta a { display: inline-flex; align-items: center; gap: 4px; }
+.av-mode-btn { display: inline-flex; align-items: center; gap: 4px; padding: 2px 9px; border: 1px solid var(--border); border-radius: 999px;
+  background: var(--accent-bg); color: var(--accent-text); font: inherit; font-size: 12.5px; cursor: pointer; }
+.av-mode-btn:hover { border-color: var(--accent); }
+/* 原网页模式：提示条用中性色，iframe 填满剩余高度 */
+.original-hint { background: var(--accent-bg); color: var(--accent-text); }
+.original-mode .weak-banner { margin: 0; border-radius: 0; }
 .weak-banner {
   display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin: -6px 0 18px; padding: 8px 12px; border-radius: 8px;
   background: var(--warn-bg); color: var(--warn); font-size: 12.5px;

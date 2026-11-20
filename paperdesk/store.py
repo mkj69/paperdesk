@@ -817,7 +817,9 @@ def _rid(d):
 
 
 def _anchor(a):
-    """网页标注的文本锚点：{type:"text", exact, prefix, suffix, start, end}；不合法返回 None。"""
+    """网页标注的文本锚点：{type:"text", exact, prefix, suffix, start, end[, space]}；不合法返回 None。
+
+    space="page" 表示锚点建在原网页模式（整页文字）上，start/end 只在同一模式里可用。"""
     if not isinstance(a, dict):
         return None
     exact = str(a.get("exact") or "")
@@ -830,6 +832,8 @@ def _anchor(a):
             out[k] = max(0, int(a.get(k)))
         except (TypeError, ValueError):
             out[k] = None
+    if a.get("space") == "page":
+        out["space"] = "page"
     return out
 
 

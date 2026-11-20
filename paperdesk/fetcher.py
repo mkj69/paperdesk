@@ -490,17 +490,18 @@ def fetch_github_readme(owner, repo, timeout=20):
     }
 
 
-def fetch_web(url, timeout=30):
-    """抓网页并抽取正文（不落盘、不缓存）。GitHub 仓库走 README 模式。"""
+def _normalize_web_url(url):
     u = (url or "").strip()
     if re.match(r"^www\.", u, re.I):
         u = "https://" + u
     p = urllib.parse.urlparse(u)
     if p.scheme not in ("http", "https") or not p.netloc:
         raise FetchError("只支持 http/https 链接")
-    gh = github_repo_of(u)
-    if gh:
-        return fetch_github_readme(gh[0], gh[1], timeout=min(timeout, 20))
+    return u
+
+
+def _download_html(u, timeout):
+    """下载网页，返回 (最终地址, Content-Type, bytes)。只在内存里，不落盘。"""
     try:
         r = _request(u, timeout=timeout, headers={
             "User-Agent": BROWSER_UA,
@@ -520,6 +521,31 @@ def fetch_web(url, timeout=30):
         r.close()
     if len(data) > WEB_LIMIT:
         raise FetchError("网页太大（超过 8MB）")
+    return final, ctype, data
+
+
+def fetch_page(url, timeout=30):
+    """原网页模式：返回完整 HTML 文本（不抽取正文、不落盘）。脚本由前端去掉，并在禁止脚本的 iframe 里显示。"""
+    u = _normalize_web_url(url)
+    final, ctype, data = _download_html(u, timeout)
+    low = ctype.lower()
+    if "application/pdf" in low or data[:5] == b"%PDF-":
+        raise FetchError("这是 PDF，不是网页")
+    if low and not any(t in low for t in ("html", "xml", "text/plain")):
+        raise FetchError("不是网页（Content-Type: %s）" % ctype)
+    text = decode_html(data, ctype)
+    if low.startswith("text/plain"):
+        text = "<!doctype html><meta charset=utf-8><pre style='white-space:pre-wrap'>%s</pre>" % html.escape(text, quote=False)
+    return {"url": final, "html": text}
+
+
+def fetch_web(url, timeout=30):
+    """抓网页并抽取正文（不落盘、不缓存）。GitHub 仓库走 README 模式。"""
+    u = _normalize_web_url(url)
+    gh = github_repo_of(u)
+    if gh:
+        return fetch_github_readme(gh[0], gh[1], timeout=min(timeout, 20))
+    final, ctype, data = _download_html(u, timeout)
     if "application/pdf" in ctype.lower() or data[:5] == b"%PDF-":
         return {"mode": "pdf", "url": final, "pdf_url": final, "title": _filename_title(final),
                 "html": "", "text": "", "word_count": 0, "weak": True}

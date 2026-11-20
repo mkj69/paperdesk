@@ -1242,6 +1242,14 @@ class TestAPI(unittest.TestCase):
         self.req("GET", "/api/web?url=" + urllib.parse.quote("ftp://x/y", safe=""), expect=502)
         self.req("GET", "/api/web", expect=400)
 
+        # 原网页模式：完整 HTML（含导航等正文以外的部分），最终地址用于 <base>
+        page = self.req("GET", "/api/webpage?url=" + urllib.parse.quote(blog_url, safe=""))
+        self.assertEqual(page["url"], blog_url)
+        self.assertIn("Subscribe to my newsletter", page["html"])
+        self.assertIn("Attention, intuitively", page["html"])
+        self.req("GET", "/api/webpage?url=" + urllib.parse.quote("ftp://x/y", safe=""), expect=502)
+        self.req("GET", "/api/webpage", expect=400)
+
         # 网页条目：type web，有论文状态，可以缓存全文、标注（锚点）
         it = self.req("POST", "/api/projects/%s/items" % pid, {"input": blog_url})
         self.assertEqual(it["type"], "web")
@@ -1258,6 +1266,18 @@ class TestAPI(unittest.TestCase):
             "anchor": {"exact": "softmax over scores", "prefix": "a ", "suffix": " gives", "start": 120, "end": 139}})
         self.assertIsNone(ann["page"])
         self.assertEqual((ann["resource_id"], ann["anchor"]["start"]), ("main", 120))
+        self.assertNotIn("space", ann["anchor"])
+        # 原网页模式的锚点带 space="page"；其他值丢弃
+        ann2 = self.req("POST", "/api/papers/%s/%s/annotations" % (pid, iid), {
+            "kind": "highlight", "quote": "softmax over scores",
+            "anchor": {"exact": "softmax over scores", "start": 900, "end": 919, "space": "page"}})
+        self.assertEqual(ann2["anchor"]["space"], "page")
+        ann3 = self.req("POST", "/api/papers/%s/%s/annotations" % (pid, iid), {
+            "kind": "highlight", "quote": "softmax over scores",
+            "anchor": {"exact": "softmax over scores", "space": "evil"}})
+        self.assertNotIn("space", ann3["anchor"])
+        for a in (ann2, ann3):
+            self.req("DELETE", "/api/papers/%s/%s/annotations/%s" % (pid, iid, a["id"]))
 
         # 关联资源：代码（离线 → 仍然保存）、重复链接返回 existing
         with mock.patch.object(fetcher, "fetch_github_readme", side_effect=fetcher.FetchError("offline")):

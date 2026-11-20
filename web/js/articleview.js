@@ -25,8 +25,11 @@ const MAX_SCALE = 1.8;
  * 并记住每个字符来自哪个文本节点的哪个偏移，用于 选区 ↔ 偏移 ↔ Range 的互相换算。
  */
 export class TextIndex {
-  constructor(root) {
+  /** @param {Element} root  @param {string} [space]  'page' = 原网页模式（整页文字），默认是正文模式 */
+  constructor(root, space = '') {
     this.root = root;
+    this.space = space;
+    this.doc = root.ownerDocument || document; // 原网页模式下 root 在 iframe 的文档里
     this.build();
   }
 
@@ -119,14 +122,14 @@ export class TextIndex {
       if (this.nodeMap.has(node)) return Math.min(this.text.length, this.nodeMap.get(node)[0]);
       return this._nextIndexed(node, false);
     }
-    const w = document.createTreeWalker(node, NodeFilter.SHOW_TEXT);
+    const w = this.doc.createTreeWalker(node, NodeFilter.SHOW_TEXT);
     let n;
     while ((n = w.nextNode())) if (this.nodeMap.has(n)) return Math.min(this.text.length, this.nodeMap.get(n)[0]);
     return this._nextIndexed(node, true);
   }
 
   _nextIndexed(node, skipChildren) {
-    const w = document.createTreeWalker(this.root, NodeFilter.SHOW_TEXT);
+    const w = this.doc.createTreeWalker(this.root, NodeFilter.SHOW_TEXT);
     w.currentNode = node;
     let n = w.nextNode();
     while (n) {
@@ -145,7 +148,7 @@ export class TextIndex {
     if (a > b) return null;
     const [n1, o1] = this.nodeAt(a);
     const [n2, o2] = this.nodeAt(b);
-    const r = document.createRange();
+    const r = this.doc.createRange();
     try {
       r.setStart(n1, o1);
       r.setEnd(n2, o2 + 1);
@@ -169,7 +172,9 @@ export class TextIndex {
     const exact = anchor.exact || '';
     if (!exact) return null;
     const { start, end } = anchor;
-    if (Number.isInteger(start) && Number.isInteger(end) && text.slice(start, end) === exact) return [start, end];
+    // 偏移只在建锚点时的同一种文字空间里有意义（正文模式 / 原网页模式的偏移不同）
+    const sameSpace = (anchor.space || '') === this.space;
+    if (sameSpace && Number.isInteger(start) && Number.isInteger(end) && text.slice(start, end) === exact) return [start, end];
     const prefix = anchor.prefix || '';
     const suffix = anchor.suffix || '';
     let best = null;
@@ -180,7 +185,7 @@ export class TextIndex {
       const pre = text.slice(Math.max(0, i - prefix.length), i);
       const suf = text.slice(i + exact.length, i + exact.length + suffix.length);
       let score = commonSuffix(pre, prefix) + commonPrefix(suf, suffix);
-      if (Number.isInteger(start)) score -= Math.abs(i - start) / 100000;
+      if (sameSpace && Number.isInteger(start)) score -= Math.abs(i - start) / 100000;
       if (score > bestScore) { bestScore = score; best = i; }
       i = text.indexOf(exact, i + 1);
     }
@@ -191,13 +196,14 @@ export class TextIndex {
       const m = re.exec(text);
       if (m) return [m.index, m.index + m[0].length];
     }
-    if (Number.isInteger(start) && Number.isInteger(end) && end <= text.length && end > start) return [start, end];
+    if (sameSpace && Number.isInteger(start) && Number.isInteger(end) && end <= text.length && end > start) return [start, end];
     return null;
   }
 
   anchorFor(start, end) {
     return {
       type: 'text',
+      ...(this.space ? { space: this.space } : {}),
       exact: this.text.slice(start, end),
       prefix: this.text.slice(Math.max(0, start - CTX), start),
       suffix: this.text.slice(end, end + CTX),
@@ -240,7 +246,8 @@ const MATH_RE = /\$\$([\s\S]+?)\$\$|\\\[([\s\S]+?)\\\]|\\\(([\s\S]+?)\\\)|(^|[^\
 
 /** 把元素内文本节点里的 $…$ / $$…$$ / \(...\) / \[...\] 渲染成 KaTeX（跳过 pre/code/a） */
 export function renderMathIn(root) {
-  const w = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
+  const doc = root.ownerDocument || document;
+  const w = doc.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
     acceptNode: (n) => (n.parentElement && n.parentElement.closest('pre, code, .katex, a, textarea') ? NodeFilter.FILTER_REJECT : NodeFilter.FILTER_ACCEPT),
   });
   const nodes = [];
@@ -251,7 +258,7 @@ export function renderMathIn(root) {
     MATH_RE.lastIndex = 0;
     let m;
     let last = 0;
-    const frag = document.createDocumentFragment();
+    const frag = doc.createDocumentFragment();
     let changed = false;
     while ((m = MATH_RE.exec(s))) {
       let tex;
@@ -261,8 +268,8 @@ export function renderMathIn(root) {
       const html = renderTex(tex, display);
       if (!html) continue;
       const startIdx = m.index + lead.length;
-      frag.append(document.createTextNode(s.slice(last, startIdx)));
-      const span = document.createElement(display ? 'div' : 'span');
+      frag.append(doc.createTextNode(s.slice(last, startIdx)));
+      const span = doc.createElement(display ? 'div' : 'span');
       span.className = display ? 'math-display' : 'math-inline';
       span.innerHTML = html;
       frag.append(span);
@@ -270,7 +277,7 @@ export function renderMathIn(root) {
       changed = true;
     }
     if (!changed) continue;
-    frag.append(document.createTextNode(s.slice(last)));
+    frag.append(doc.createTextNode(s.slice(last)));
     node.replaceWith(frag);
   }
 }
@@ -409,7 +416,8 @@ export class ArticleView extends BaseView {
           data.byline ? h('span', {}, data.byline) : null,
           data.published ? h('span', {}, String(data.published).slice(0, 10)) : null,
           mins ? h('span', {}, `约 ${mins} 分钟读完`) : null,
-          h('a', { href: url, target: '_blank', rel: 'noopener' }, icon('external', 13), '原网页')));
+          h('a', { href: url, target: '_blank', rel: 'noopener' }, icon('external', 13), '原网页'),
+          this.opts.onOriginalMode ? h('button', { class: 'av-mode-btn', type: 'button', title: '保留原网页的排版和样式，直接在上面划词高亮、记笔记', onclick: () => this.opts.onOriginalMode() }, icon('eye', 13), '在原网页上阅读和标注') : null));
     }
     const body = h('div', { class: 'article-body md' });
     if (mode === 'readme') {
@@ -574,7 +582,7 @@ export class ArticleView extends BaseView {
       if (NO_WRAP_PARENTS.has(node.parentNode.nodeName) && !piece.trim()) continue;
       if (sg.end + 1 < node.length) node.splitText(sg.end + 1);
       if (sg.start > 0) node = node.splitText(sg.start);
-      const mark = document.createElement('mark');
+      const mark = node.ownerDocument.createElement('mark');
       mark.className = cls;
       mark.dataset.id = a.id;
       node.parentNode.insertBefore(mark, node);
@@ -643,16 +651,27 @@ export class ArticleView extends BaseView {
     const r = this.index.rangeFor(pos[0], pos[1]);
     if (!r) return false;
     this._scrollTo(r.getBoundingClientRect());
-    if (window.CSS && CSS.highlights && window.Highlight) {
-      CSS.highlights.set('pd-flash', new Highlight(r));
+    const hl = this._hlApi();
+    if (hl) {
+      hl.reg.set('pd-flash', new hl.Highlight(r));
       clearTimeout(this._flashAT);
-      this._flashAT = setTimeout(() => CSS.highlights.delete('pd-flash'), 2400);
+      this._flashAT = setTimeout(() => { try { hl.reg.delete('pd-flash'); } catch { /* ignore */ } }, 2400);
     }
     return true;
   }
 
+  /** 可视区域（子类原网页模式里是 iframe 的视口） */
+  _viewBox() {
+    return this.scrollEl.getBoundingClientRect();
+  }
+
+  /** CSS Custom Highlight API（子类里换成 iframe 的 window） */
+  _hlApi() {
+    return window.CSS && CSS.highlights && window.Highlight ? { reg: CSS.highlights, Highlight: window.Highlight } : null;
+  }
+
   _scrollTo(rect, frac = 0.3) {
-    const box = this.scrollEl.getBoundingClientRect();
+    const box = this._viewBox();
     this.scrollEl.scrollTo({ top: Math.max(0, this.scrollEl.scrollTop + rect.top - box.top - box.height * frac), behavior: 'smooth' });
   }
 
@@ -688,7 +707,7 @@ export class ArticleView extends BaseView {
 
   /** 「翻译当前页」：从当前可见位置开始的若干段 */
   async getPageParagraphs() {
-    const box = this.scrollEl.getBoundingClientRect();
+    const box = this._viewBox();
     const out = [];
     let chars = 0;
     for (const el of this._blocks()) {
@@ -753,23 +772,24 @@ export class ArticleView extends BaseView {
     this.clearReadHighlight();
     if (!this.index) return;
     const r = this.index.rangeFor(it.start, it.end);
-    if (r && window.CSS && CSS.highlights && window.Highlight) CSS.highlights.set('pd-tts', new Highlight(r));
+    const hl = this._hlApi();
+    if (r && hl) hl.reg.set('pd-tts', new hl.Highlight(r));
     else if (it.el) { it.el.classList.add('tts-cur-block'); this._ttsEl = it.el; }
     if (!follow) return;
     const rect = r ? r.getBoundingClientRect() : it.el && it.el.getBoundingClientRect();
     if (!rect) return;
-    const box = this.scrollEl.getBoundingClientRect();
+    const box = this._viewBox();
     if (rect.top < box.top + box.height * 0.12 || rect.bottom > box.top + box.height * 0.85) this._scrollTo(rect, 0.35);
   }
 
   clearReadHighlight() {
-    try { if (window.CSS && CSS.highlights) CSS.highlights.delete('pd-tts'); } catch { /* ignore */ }
+    try { const hl = this._hlApi(); if (hl) hl.reg.delete('pd-tts'); } catch { /* ignore */ }
     if (this._ttsEl) { this._ttsEl.classList.remove('tts-cur-block'); this._ttsEl = null; }
   }
 
   /** 第一个出现在视口里的朗读条目下标 */
   firstVisibleIndex(items) {
-    const box = this.scrollEl.getBoundingClientRect();
+    const box = this._viewBox();
     for (let i = 0; i < items.length; i++) {
       const r = this.index.rangeFor(items[i].start, items[i].end);
       const rect = r ? r.getBoundingClientRect() : items[i].el && items[i].el.getBoundingClientRect();
@@ -790,7 +810,7 @@ export class ArticleView extends BaseView {
     this.destroyed = true;
     document.removeEventListener('mouseup', this._onUp);
     this.clearReadHighlight();
-    try { if (window.CSS && CSS.highlights) CSS.highlights.delete('pd-flash'); } catch { /* ignore */ }
+    try { const hl = this._hlApi(); if (hl) hl.reg.delete('pd-flash'); } catch { /* ignore */ }
     this.root.innerHTML = '';
   }
 }

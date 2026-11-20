@@ -4,6 +4,7 @@ import { get, post, patch, del, put, loadSettings, loadHealth, readerUrl, STATIC
 import { h, icon, toast, toastError, copyText, debounce, closePopMenus, truncate, ENGINE_LABEL, popMenu, promptDialog, confirmDialog } from './ui.js';
 import { PdfView } from './pdfview.js';
 import { ArticleView, VideoView, IframeView, NoticeView, loadingBox, fetchReadmeDirect } from './articleview.js';
+import { OriginalView, sanitizePage } from './originalview.js';
 import { itemResources, viewerFor, pdfUrlOf, videoEmbed, resLabel, kindMeta, KIND_OPTIONS, hostOf, isGithubRepo } from './resources.js';
 import { setMarkdown } from './markdown.js';
 import { createEditor } from './editor.js';
@@ -307,6 +308,9 @@ export async function mountReader(root, { pid, iid, page: pageParam, anno: annoP
     const kind = viewerFor(r);
     popMenu(anchor, [
       { label: '在新标签页打开', icon: 'external', onClick: () => window.open(r.url, '_blank', 'noopener') },
+      ...(kind === 'article' && canOriginal(r) ? [webMode() === 'original'
+        ? { label: '切回正文模式', icon: 'file', onClick: () => setWebMode('reader', r.id) }
+        : { label: '在原网页上阅读和标注', icon: 'edit', onClick: () => setWebMode('original', r.id) }] : []),
       ...(kind === 'article' ? [{ label: '用 iframe 嵌入原网页（无法标注）', icon: 'eye', onClick: () => switchResource(r.id, { forceIframe: true }) }] : []),
       { label: '复制链接', icon: 'copy', onClick: () => copyText(r.url) },
       ...(!STATIC && !r.main ? ['-',
@@ -428,7 +432,7 @@ export async function mountReader(root, { pid, iid, page: pageParam, anno: annoP
     try {
       const kind = forceIframe ? 'iframe' : viewerFor(res);
       if (kind === 'pdf') v = await openPdf(res, host, tok, page);
-      else if (kind === 'article') v = await openArticle(res, host, tok);
+      else if (kind === 'article') v = canOriginal(res) && webMode() === 'original' ? await openOriginal(res, host, tok) : await openArticle(res, host, tok);
       else if (kind === 'video') v = new VideoView(host, commonOpts()).load({ embed: videoEmbed(res.url), url: res.url, title: res.title !== res.url ? res.title : '', kind: res.kind });
       else if (kind === 'iframe') v = new IframeView(host, commonOpts()).load({ url: res.url, hint: forceIframe ? '嵌入原网页：这里无法划词标注；如果一片空白，说明网站拒绝被嵌入。' : null });
       else v = noticeView(host, res, { message: '这个资源无法在页面里直接显示。' });
@@ -538,12 +542,61 @@ export async function mountReader(root, { pid, iid, page: pageParam, anno: annoP
       h('span', { class: 'spacer' }),
       h('a', { class: 'btn btn-sm', href: res.url, target: '_blank', rel: 'noopener' }, icon('external', 13), '在新标签页打开原网页'),
       h('button', { class: 'btn btn-sm', onclick: () => switchResource(res.id, { forceIframe: true }) }, icon('eye', 13), '仍然用 iframe 嵌入（无法标注）')) : null;
-    const v = new ArticleView(host, commonOpts()).load(data, { resource: res, banner });
+    const v = new ArticleView(host, { ...commonOpts(), onOriginalMode: canOriginal(res) ? () => setWebMode('original', res.id) : null }).load(data, { resource: res, banner });
     if (res.main && !item.title && data.title) item.title = data.title;
     if (!res.title || res.title === res.url) res.title = data.title || res.title;
     renderResBar();
     setTimeout(() => { if (!v.destroyed) ctx.book.onDocReady(); }, 0);
     if (!STATIC && !uploaded.has(res.id)) uploadText(v, res.id);
+    return v;
+  }
+
+  // ---------------- 原网页模式（在原网页上标注） ----------------
+  // 选择会记住（localStorage），之后打开博客 / 网页都用同一种模式；GitHub 仓库始终用 README 视图。
+  function webMode() {
+    try { return localStorage.getItem('pd.webMode') === 'original' ? 'original' : 'reader'; } catch { return 'reader'; }
+  }
+  function setWebMode(mode, rid) {
+    try { localStorage.setItem('pd.webMode', mode); } catch { /* ignore */ }
+    switchResource(rid);
+  }
+  function canOriginal(res) {
+    return !STATIC && !!res && !!res.url && !isGithubRepo(res.url);
+  }
+
+  async function openOriginal(res, host, tok) {
+    const loading = loadingBox('正在加载原网页（只在内存中，不落盘）…');
+    host.append(loading);
+    let data;
+    try {
+      data = await get(`/webpage?url=${encodeURIComponent(res.url)}`);
+      if (data && data.error) throw new Error(data.error);
+    } catch (e) {
+      if (tok !== switchTok) return null;
+      loading.remove();
+      return noticeView(host, res, {
+        message: `无法加载原网页：${e.message || e}`,
+        actions: [
+          h('button', { class: 'btn btn-primary btn-sm', onclick: () => setWebMode('reader', res.id) }, icon('file', 13), '切回正文模式'),
+          h('a', { class: 'btn btn-sm', href: res.url, target: '_blank', rel: 'noopener' }, icon('external', 13), '在新标签页打开原网页'),
+          h('button', { class: 'btn btn-sm btn-ghost', onclick: () => switchResource(res.id) }, icon('refresh', 13), '重试'),
+        ],
+      });
+    }
+    if (tok !== switchTok) return null;
+    loading.remove();
+    const page = sanitizePage(data.html, data.url || res.url);
+    const v = new OriginalView(host, { ...commonOpts(), onReaderMode: () => setWebMode('reader', res.id) })
+      .load({ ...page, url: data.url || res.url }, { resource: res });
+    v.ready.then(() => {
+      if (v.destroyed || tok !== switchTok) return;
+      const t = page.title || v.pageTitle;
+      if (t && (!res.title || res.title === res.url)) { res.title = t; renderResBar(); }
+      if (res.main && !item.title && t) item.title = t;
+      ctx.book.onDocReady();
+      ctx.panels.refresh();
+      if (!uploaded.has(res.id)) uploadText(v, res.id);
+    });
     return v;
   }
 

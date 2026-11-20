@@ -311,6 +311,18 @@ def h_web(app, h, m, q, body):
         raise ApiError(502, "网页加载失败：%s" % e)
 
 
+@route("GET", r"/api/webpage")
+def h_webpage(app, h, m, q, body):
+    """原网页模式：完整 HTML（不落盘）。前端去掉脚本后放进禁止脚本的同源 iframe，用来在原网页上标注。"""
+    url = (q.get("url") or [""])[0]
+    if not url:
+        raise ApiError(400, "缺少 url 参数")
+    try:
+        return fetcher.fetch_page(url)
+    except fetcher.FetchError as e:
+        raise ApiError(502, "网页加载失败：%s" % e)
+
+
 @route("PATCH", r"/api/projects/" + ID + r"/items/" + IID)
 def h_item_patch(app, h, m, q, body):
     return store.update_item(app.data_dir, m.group(1), m.group(2), body)
