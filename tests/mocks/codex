@@ -1,0 +1,113 @@
+#!/usr/bin/env python3
+"""Mock of the Codex CLI (`codex exec ...`) for PaperDesk tests."""
+import json
+import re
+import os
+import sys
+import time
+import uuid
+
+
+def emit(obj):
+    sys.stdout.write(json.dumps(obj, ensure_ascii=False) + "\n")
+    sys.stdout.flush()
+
+
+def vocab_json(prompt):
+    """Dictionary-lookup prompts ask for strict JSON."""
+    m = re.search(r'(?:单词|生词|word)["”]?\s*[:：]\s*["“]?([A-Za-z][A-Za-z\-\' ]{0,60})', prompt)
+    word = (m.group(1).strip() if m else "word")
+    return json.dumps({"phonetic": "/ˈθɪŋ/", "pos": "n.", "meaning": f"（模拟释义）{word}：事物；东西",
+                       "context_meaning": f"在本文语境中，{word} 指被讨论的对象",
+                       "context_translation": "（模拟）这句话的中文翻译。"}, ensure_ascii=False)
+
+
+def build_answer(prompt):
+    if "JSON" in prompt or ("生词" in prompt and "归档" not in prompt and "总结" not in prompt):
+        return vocab_json(prompt)
+    if "翻译" in prompt or "Translate" in prompt or "translate" in prompt:
+        src = prompt.strip().split("\n")[-1].strip()
+        return "【译文】" + src[:40]
+    head = " ".join(prompt.strip().split())[:30]
+    if os.path.exists("paper.txt"):
+        with open("paper.txt", encoding="utf-8") as f:
+            ctx = f"我读取了 ./paper.txt，共 {len(f.read())} 个字符。"
+    else:
+        ctx = "当前目录没有 paper.txt。"
+    return (f"（Codex）关于「{head}」：\n\n**要点**：缩放因子是 $\\sqrt{{d_k}}$ (p.1)。\n\n{ctx}\n")
+
+
+def main():
+    argv = sys.argv[1:]
+    if argv[:1] == ["--version"]:
+        print("codex-cli 0.99.0-mock")
+        return
+    if not argv or argv[0] != "exec":
+        sys.stderr.write("mock codex: only `exec` is supported\n")
+        sys.exit(2)
+    argv = argv[1:]
+    resume_id = None
+    if "resume" in argv:  # 真实 CLI：exec 的选项可以出现在 resume 子命令之前或之后
+        k = argv.index("resume")
+        before, after = argv[:k], argv[k + 1:]
+        if after and not after[0].startswith("-"):
+            resume_id = after[0]
+            after = after[1:]
+        argv = before + after
+    as_json = False
+    out_file = None
+    positional = []
+    i = 0
+    value_flags = {"--sandbox", "-s", "-m", "--model", "-C", "--cd", "-c", "--config",
+                   "--profile", "-p", "--color", "--output-schema"}
+    while i < len(argv):
+        a = argv[i]
+        if a == "--json" or a == "--experimental-json":
+            as_json = True
+        elif a in ("-o", "--output-last-message"):
+            out_file = argv[i + 1] if i + 1 < len(argv) else None
+            i += 1
+        elif a.startswith("--output-last-message="):
+            out_file = a.split("=", 1)[1]
+        elif a in value_flags:
+            if a in ("-C", "--cd") and i + 1 < len(argv):
+                try:
+                    os.chdir(argv[i + 1])
+                except OSError:
+                    pass
+            i += 1
+        elif a in ("--skip-git-repo-check", "--full-auto", "--last", "--dangerously-bypass-approvals-and-sandbox"):
+            pass
+        elif a.startswith("-") and a != "-":
+            pass
+        else:
+            positional.append(a)
+        i += 1
+    prompt = " ".join(positional)
+    if prompt in ("", "-") and not sys.stdin.isatty():
+        prompt = sys.stdin.read()
+    if not prompt.strip():
+        sys.stderr.write("No prompt provided\n")
+        sys.exit(1)
+    if resume_id and resume_id.startswith("bad"):
+        sys.stderr.write(f"Error: thread {resume_id} not found\n")
+        sys.exit(1)
+    thread_id = resume_id or str(uuid.uuid4())
+    answer = build_answer(prompt)
+    if as_json:
+        emit({"type": "thread.started", "thread_id": thread_id})
+        emit({"type": "turn.started"})
+        time.sleep(0.05)
+        emit({"type": "item.completed", "item": {"id": "item_0", "type": "reasoning", "text": "**Thinking**"}})
+        time.sleep(0.05)
+        emit({"type": "item.completed", "item": {"id": "item_1", "type": "agent_message", "text": answer}})
+        emit({"type": "turn.completed", "usage": {"input_tokens": 10, "cached_input_tokens": 0, "output_tokens": 20}})
+    else:
+        sys.stdout.write(answer + "\n")
+    if out_file:
+        with open(out_file, "w", encoding="utf-8") as f:
+            f.write(answer)
+
+
+if __name__ == "__main__":
+    main()
