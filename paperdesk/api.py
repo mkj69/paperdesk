@@ -512,9 +512,18 @@ def h_vocab_add(app, h, m, q, body):
         except Exception:
             pass
     try:
-        return store.add_vocab(app.data_dir, pid, iid, entry)
+        out = store.add_vocab(app.data_dir, pid, iid, entry)
     except ValueError as e:
         raise ApiError(400, str(e))
+    # 已有生词但上次查词失败 / 没有释义（例如 Google 429）：用当前查词引擎重查一次
+    if existing is not None and (out.get("lookup_error") or not out.get("meaning")):
+        s = app.settings()
+        res = agents.lookup_word(out["word"], out.get("context") or "", body.get("engine") or s.get("vocab_engine"), s)
+        patch = {k: res[k] for k in ("phonetic", "pos", "meaning", "context_meaning", "context_translation")
+                 if res.get(k)}
+        patch["lookup_error"] = res.get("lookup_error")
+        out = dict(store.update_vocab(app.data_dir, pid, iid, out["id"], patch), merged=True)
+    return out
 
 
 @route("PATCH", P + r"/vocab/" + IID)
